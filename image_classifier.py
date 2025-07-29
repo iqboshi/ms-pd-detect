@@ -12,6 +12,24 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import seaborn as sns
 from tqdm import tqdm
+import random
+import warnings
+import logging
+from datetime import datetime
+
+
+def set_seed(seed=42):
+    """设置所有随机种子以确保结果可重复"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 确保CUDA操作的确定性
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # 设置环境变量以确保完全确定性
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
 
 
@@ -132,13 +150,28 @@ class CNNModel(nn.Module):
         return x
 
 class ImageClassifier:
-    def __init__(self, data_dir='data', img_size=(64, 64)):
+    def __init__(self, data_dir='data', img_size=(64, 64), output_dir=None):
         self.data_dir = data_dir
         self.img_size = img_size
         self.model = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.class_names = ['diseased', 'healthy']
         print(f"Using device: {self.device}")
+        
+        # 创建输出目录管理
+        if output_dir is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.output_dir = f"outputs/run_{timestamp}"
+        else:
+            self.output_dir = output_dir
+        
+        # 确保输出目录存在
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'models'), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'plots'), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'logs'), exist_ok=True)
+        
+        print(f"Output directory: {self.output_dir}")
         
     def load_and_preprocess_data(self):
         """Load and preprocess remote sensing spectral data"""
@@ -284,10 +317,38 @@ class ImageClassifier:
         self.model = model
         return model
     
+    def _save_training_log(self, history, best_val_acc, epochs, learning_rate, batch_size):
+        """保存训练日志到文件"""
+        import json
+        
+        log_data = {
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'training_parameters': {
+                'epochs': epochs,
+                'learning_rate': learning_rate,
+                'batch_size': batch_size,
+                'image_size': self.img_size,
+                'device': str(self.device)
+            },
+            'best_validation_accuracy': best_val_acc,
+            'final_training_accuracy': history['train_acc'][-1] if history['train_acc'] else 0,
+            'final_validation_accuracy': history['val_acc'][-1] if history['val_acc'] else 0,
+            'training_history': history
+        }
+        
+        log_file = os.path.join(self.output_dir, 'logs', 'training_log.json')
+        with open(log_file, 'w', encoding='utf-8') as f:
+            json.dump(log_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"Training log saved to: {log_file}")
+    
 
     
     def train_model(self, X, y, test_size=0.2, epochs=30, batch_size=32, learning_rate=0.001):
         """Train the spectral classification model"""
+        # 设置随机种子确保训练可重复
+        set_seed(42)
+        
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=42, stratify=y
@@ -296,13 +357,13 @@ class ImageClassifier:
         print(f"Training set: {len(X_train)} spectral images")
         print(f"Test set: {len(X_test)} spectral images")
         
-        # Simplified data augmentation transforms for spectral data
+        # 减少数据增强的随机性以提高训练稳定性
         train_transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.RandomRotation(20),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.RandomRotation(10),  # 减少旋转角度
+            transforms.RandomHorizontalFlip(p=0.3),  # 降低翻转概率
+            transforms.RandomVerticalFlip(p=0.3),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),  # 减少颜色抖动
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
@@ -314,12 +375,18 @@ class ImageClassifier:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
-        # Create datasets and data loaders with standard augmentation
+        # Create datasets and data loaders with deterministic settings
         train_dataset = SpectralImageDataset(X_train, y_train, transform=train_transform)
         test_dataset = SpectralImageDataset(X_test, y_test, transform=test_transform)
         
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        # 使用固定的generator确保DataLoader的确定性
+        generator = torch.Generator()
+        generator.manual_seed(42)
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                                num_workers=0, generator=generator, drop_last=True)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
+                               num_workers=0, drop_last=False)
         
         # Use simple but effective class weighting
         class_counts = np.bincount(y_train)
@@ -330,11 +397,14 @@ class ImageClassifier:
         # Use standard CrossEntropyLoss with class weights
         criterion = nn.CrossEntropyLoss(weight=class_weights.to(self.device))
         
-        # Use AdamW optimizer with weight decay
-        optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=0.01)
+        # 使用更稳定的优化器配置
+        optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, 
+                              weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8)
         
-        # Use cosine annealing with warm restarts
-        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+        # 使用更稳定的学习率调度器
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', 
+                                                       factor=0.5, patience=5, 
+                                                       verbose=True, min_lr=1e-7)
         
         # Training history
         history = {
@@ -415,15 +485,16 @@ class ImageClassifier:
             print(f'  Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%')
             print(f'  Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%')
             
-            # Learning rate scheduling - CosineAnnealingWarmRestarts steps every epoch
-            scheduler.step()
+            # Learning rate scheduling - ReduceLROnPlateau based on validation accuracy
+            scheduler.step(val_acc)
             
             # Early stopping check
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 patience_counter = 0
-                # Save best model
-                torch.save(self.model.state_dict(), 'best_model.pth')
+                # Save best model to output directory
+                best_model_path = os.path.join(self.output_dir, 'models', 'best_model.pth')
+                torch.save(self.model.state_dict(), best_model_path)
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
@@ -431,9 +502,13 @@ class ImageClassifier:
                     break
         
         # Load best model
-        self.model.load_state_dict(torch.load('best_model.pth'))
+        best_model_path = os.path.join(self.output_dir, 'models', 'best_model.pth')
+        self.model.load_state_dict(torch.load(best_model_path))
         
         print(f"Training completed, best validation accuracy: {best_val_acc:.2f}%")
+        
+        # 保存训练日志
+        self._save_training_log(history, best_val_acc, epochs, learning_rate, batch_size)
         
         return history, X_test, y_test
     
@@ -492,7 +567,11 @@ class ImageClassifier:
         plt.ylabel('True Label')
         plt.xlabel('Predicted Label')
         plt.tight_layout()
-        plt.savefig('confusion_matrix.png', dpi=300, bbox_inches='tight')
+        
+        # 保存到输出目录
+        confusion_matrix_path = os.path.join(self.output_dir, 'plots', 'confusion_matrix.png')
+        plt.savefig(confusion_matrix_path, dpi=300, bbox_inches='tight')
+        print(f"Confusion matrix saved to: {confusion_matrix_path}")
         plt.show()
         
         return accuracy, y_pred, y_pred_prob
@@ -520,12 +599,18 @@ class ImageClassifier:
         ax2.grid(True)
         
         plt.tight_layout()
-        plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
+        
+        # 保存到输出目录
+        training_history_path = os.path.join(self.output_dir, 'plots', 'training_history.png')
+        plt.savefig(training_history_path, dpi=300, bbox_inches='tight')
+        print(f"Training history saved to: {training_history_path}")
         plt.show()
     
-    def save_model(self, filepath='disease_classifier_model.pth'):
+    def save_model(self, filename='disease_classifier_model.pth'):
         """Save the trained model"""
         if self.model:
+            # 保存到models子目录
+            filepath = os.path.join(self.output_dir, 'models', filename)
             torch.save({
                 'model_state_dict': self.model.state_dict(),
                 'img_size': self.img_size,
@@ -533,8 +618,15 @@ class ImageClassifier:
             }, filepath)
             print(f"Model saved to: {filepath}")
     
-    def load_model(self, filepath='disease_classifier_model.pth'):
+    def load_model(self, filename='disease_classifier_model.pth'):
         """Load a trained model with optimal threshold"""
+        # 优先从输出目录加载
+        filepath = os.path.join(self.output_dir, 'models', filename)
+        
+        # 如果输出目录中没有，则尝试从根目录加载（向后兼容）
+        if not os.path.exists(filepath):
+            filepath = filename
+            
         checkpoint = torch.load(filepath, map_location=self.device)
         
         # Create model
@@ -604,6 +696,9 @@ class ImageClassifier:
 
 def main():
     """Main function for remote sensing spectral data classification"""
+    # 设置随机种子确保结果可重复
+    set_seed(42)
+    
     # Create classifier instance
     classifier = ImageClassifier()
     
@@ -630,9 +725,9 @@ def main():
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
-    # Train model with improved parameters
+    # Train model with stable parameters for consistent results
     print("\nStarting model training...")
-    history, X_test, y_test = classifier.train_model(X, y, epochs=50, learning_rate=0.0005, batch_size=16)
+    history, X_test, y_test = classifier.train_model(X, y, epochs=40, learning_rate=0.001, batch_size=16)
     
     # Evaluate model on test set
     print("\nEvaluating model performance on test set...")
