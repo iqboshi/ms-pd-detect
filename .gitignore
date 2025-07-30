@@ -27,7 +27,6 @@ env/
 ENV/
 
 # Model files
-*.pth
 *.pkl
 *.h5
 *.model
