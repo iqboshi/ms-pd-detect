@@ -34,7 +34,6 @@ ms-pd-detect/
 ├── full_pipeline.py          # 完整处理流水线
 ├── image_classifier.py       # 健康/疾病分类器
 ├── severity_classifier.py    # 严重程度分级器
-├── test_all_diseased.py      # 测试脚本
 ├── requirements.txt          # 依赖包列表
 ├── 水稻所地块裁剪15m.tif      # 示例输入图像
 └── outputs/                  # 输出目录
@@ -83,12 +82,6 @@ python image_classifier.py
 
 # 训练严重程度分级器
 python severity_classifier.py
-```
-
-### 3. 测试严重程度分级
-
-```bash
-python test_all_diseased.py
 ```
 
 ## 输出结果
