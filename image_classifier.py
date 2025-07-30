@@ -219,62 +219,66 @@ class ImageClassifier:
     def _load_image(self, img_path):
         """Load and preprocess single spectral image"""
         try:
-            # Try using tifffile library to load multi-channel TIFF images
-            try:
-                import tifffile
-                import warnings
-                import logging
-                
-                # Suppress all warnings and logging during TIFF reading
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    # Temporarily disable logging
-                    logging.disable(logging.CRITICAL)
-                    try:
-                        img_array = tifffile.imread(img_path)
-                    finally:
-                        # Re-enable logging
-                        logging.disable(logging.NOTSET)
-                
-                # Handle multi-channel spectral data - use more channels for better classification
-                if len(img_array.shape) == 3 and img_array.shape[2] > 3:
-                    # For spectral data, use more meaningful channel combinations
-                    # Take channels that might represent different spectral bands
-                    if img_array.shape[2] >= 6:
-                        # Use channels with better spacing for spectral analysis
-                        selected_channels = [0, img_array.shape[2]//3, img_array.shape[2]*2//3]
-                        img_array = img_array[:, :, selected_channels]
-                    else:
-                        # If less than 6 channels, take first 3
-                        img_array = img_array[:, :, :3]
-                elif len(img_array.shape) == 2:
-                    # If grayscale, convert to RGB
-                    img_array = np.stack([img_array] * 3, axis=2)
-                elif len(img_array.shape) == 3 and img_array.shape[2] == 1:
-                    # If single channel with third dimension, convert to RGB
-                    img_array = np.repeat(img_array, 3, axis=2)
-                
-                # Improved normalization for spectral data
-                if img_array.dtype != np.uint8:
-                    # Use percentile-based normalization to handle outliers
-                    p2, p98 = np.percentile(img_array, (2, 98))
-                    img_array = np.clip(img_array, p2, p98)
-                    img_array = ((img_array - p2) / (p98 - p2) * 255).astype(np.uint8)
-                
-                # Convert to PIL image for resizing
-                img = Image.fromarray(img_array)
-                img = img.resize(self.img_size, Image.Resampling.LANCZOS)
-                
-                # Convert to numpy array and normalize to 0-1
-                img_array = np.array(img) / 255.0
-                
-                return img_array
-                
-            except ImportError:
-                # If tifffile library not available, try PIL
-                pass
+            # Check file extension to determine loading method
+            file_ext = os.path.splitext(img_path)[1].lower()
             
-            # Try using PIL to load TIFF images
+            if file_ext in ['.tif', '.tiff']:
+                # Try using tifffile library to load multi-channel TIFF images
+                try:
+                    import tifffile
+                    import warnings
+                    import logging
+                    
+                    # Suppress all warnings and logging during TIFF reading
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        # Temporarily disable logging
+                        logging.disable(logging.CRITICAL)
+                        try:
+                            img_array = tifffile.imread(img_path)
+                        finally:
+                            # Re-enable logging
+                            logging.disable(logging.NOTSET)
+                    
+                    # Handle multi-channel spectral data - use more channels for better classification
+                    if len(img_array.shape) == 3 and img_array.shape[2] > 3:
+                        # For spectral data, use more meaningful channel combinations
+                        # Take channels that might represent different spectral bands
+                        if img_array.shape[2] >= 6:
+                            # Use channels with better spacing for spectral analysis
+                            selected_channels = [0, img_array.shape[2]//3, img_array.shape[2]*2//3]
+                            img_array = img_array[:, :, selected_channels]
+                        else:
+                            # If less than 6 channels, take first 3
+                            img_array = img_array[:, :, :3]
+                    elif len(img_array.shape) == 2:
+                        # If grayscale, convert to RGB
+                        img_array = np.stack([img_array] * 3, axis=2)
+                    elif len(img_array.shape) == 3 and img_array.shape[2] == 1:
+                        # If single channel with third dimension, convert to RGB
+                        img_array = np.repeat(img_array, 3, axis=2)
+                    
+                    # Improved normalization for spectral data
+                    if img_array.dtype != np.uint8:
+                        # Use percentile-based normalization to handle outliers
+                        p2, p98 = np.percentile(img_array, (2, 98))
+                        img_array = np.clip(img_array, p2, p98)
+                        img_array = ((img_array - p2) / (p98 - p2) * 255).astype(np.uint8)
+                    
+                    # Convert to PIL image for resizing
+                    img = Image.fromarray(img_array)
+                    img = img.resize(self.img_size, Image.Resampling.LANCZOS)
+                    
+                    # Convert to numpy array and normalize to 0-1
+                    img_array = np.array(img) / 255.0
+                    
+                    return img_array
+                    
+                except ImportError:
+                    # If tifffile library not available, fall through to PIL
+                    pass
+            
+            # Use PIL to load all other image formats (PNG, JPG, etc.) and TIFF as fallback
             with Image.open(img_path) as img:
                 # If multi-page TIFF, take only first page
                 if hasattr(img, 'n_frames') and img.n_frames > 1:
@@ -691,7 +695,6 @@ class ImageClassifier:
             
             result = self.class_names[predicted_class]
         
-        print(f"Prediction: {result} (Confidence: {confidence:.4f})")
         return result, confidence
 
 def main():

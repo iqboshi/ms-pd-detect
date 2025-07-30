@@ -114,15 +114,18 @@ class SeverityDataset(Dataset):
 class SeverityClassifier:
     """疾病严重程度分级器"""
     
-    def __init__(self, data_dir='data', n_levels=6, img_size=(64, 64), device=None):
+    def __init__(self, data_dir='data', n_levels=6, img_size=(64, 64), device=None, output_dir=None):
         self.data_dir = data_dir
         self.n_levels = n_levels
         self.img_size = img_size
         self.device = device if device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # 创建输出目录
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.output_dir = os.path.join('outputs', f'severity_run_{timestamp}')
+        if output_dir is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.output_dir = os.path.join('outputs', f'severity_run_{timestamp}')
+        else:
+            self.output_dir = output_dir
         os.makedirs(os.path.join(self.output_dir, 'models'), exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, 'plots'), exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, 'logs'), exist_ok=True)

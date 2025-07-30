@@ -36,6 +36,8 @@ ENV/
 *.png
 *.jpg
 *.jpeg
+*.tif
+*.json
 
 # IDE
 .vscode/

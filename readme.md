@@ -1,149 +1,165 @@
-# Remote Sensing Spectral Data Classification System (MS-PD Detection)
+# MS-PD-Detect: 多光谱图像病害检测与分级系统
 
-This is a deep learning-based remote sensing spectral data classification system for distinguishing between diseased and healthy vegetation areas.
+## 项目简介
 
-## Project Structure
+本项目是一个基于深度学习的多光谱图像病害检测与严重程度分级系统。系统能够处理大尺寸TIFF图像，自动进行切片、健康/疾病分类、严重程度分级，并生成可视化结果。
+
+## 主要功能
+
+### 1. 大图像处理
+- 支持多光谱TIFF图像加载
+- 自动检测和处理nodata区域
+- 智能图像切片，避免无效区域参与计算
+
+### 2. 健康/疾病分类
+- 基于CNN的二分类模型
+- 自动跳过无效切片，提高处理效率
+- 支持预训练模型加载
+
+### 3. 严重程度分级
+- 对疾病切片进行6级严重程度分类
+- **注意：当前的6级分类仅代表不同类别，不代表数值高低关系**
+- **后续将进行语义对齐，建立等级间的有序关系**
+
+### 4. 结果可视化
+- 生成彩色分级结果图
+- 无效区域显示为白色背景
+- 提供带图例的可视化结果
+- 生成详细的处理统计报告
+
+## 项目结构
 
 ```
 ms-pd-detect/
-├── data/
-│   ├── diseased/          # Diseased spectral data folder (71 .tif images)
-│   └── healthy/           # Healthy spectral data folder (130 .tif images)
-├── image_classifier.py    # Main classifier class
-├── predict_example.py     # Prediction example script
-├── requirements.txt       # Dependencies list
-└── README.md             # Project documentation
+├── full_pipeline.py          # 完整处理流水线
+├── image_classifier.py       # 健康/疾病分类器
+├── severity_classifier.py    # 严重程度分级器
+├── test_all_diseased.py      # 测试脚本
+├── requirements.txt          # 依赖包列表
+├── 水稻所地块裁剪15m.tif      # 示例输入图像
+└── outputs/                  # 输出目录
+    ├── run_*/               # 健康/疾病分类模型输出
+    ├── severity_run_*/      # 严重程度分级模型输出
+    └── full_pipeline_*/     # 完整流水线输出
 ```
 
-## Features
-
-- **Deep Learning Model**: Convolutional Neural Network (CNN) built with PyTorch for spectral data classification
-- **GPU Acceleration**: Automatic detection and use of GPU for accelerated training and inference
-- **Data Augmentation**: Automatic application of rotation, scaling, flipping and other data augmentation techniques
-- **Model Evaluation**: Detailed performance evaluation metrics and visualization
-- **Easy to Use**: Simple API interface supporting single spectral image prediction
-- **Model Persistence**: Automatic model saving after training with support for subsequent loading
-
-## Installation
+## 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Usage
+主要依赖包：
+- torch
+- torchvision
+- opencv-python
+- numpy
+- matplotlib
+- tifffile
+- scikit-learn
+- tqdm
+- seaborn
 
-### 1. Train Model
+## 使用方法
 
-Run the main training script:
+### 1. 运行完整流水线
 
 ```bash
+python full_pipeline.py
+```
+
+这将执行完整的处理流程：
+1. 加载大图像并检测nodata区域
+2. 智能切片（跳过无效区域）
+3. 健康/疾病分类
+4. 疾病严重程度分级
+5. 生成可视化结果
+
+### 2. 单独训练分类器
+
+```bash
+# 训练健康/疾病分类器
 python image_classifier.py
+
+# 训练严重程度分级器
+python severity_classifier.py
 ```
 
-This will:
-- Automatically load all spectral images from the data folder
-- Create and train the CNN model
-- Display training progress and performance metrics
-- Generate confusion matrix and training history charts
-- Save the trained model as `disease_classifier_model.pth`
-
-### 2. Use Trained Model for Prediction
-
-Run the prediction example:
+### 3. 测试严重程度分级
 
 ```bash
-python predict_example.py
+python test_all_diseased.py
 ```
 
-Or use in Python code:
+## 输出结果
 
-```python
-from image_classifier import ImageClassifier
+每次运行完整流水线会在 `outputs/full_pipeline_YYYYMMDD_HHMMSS/` 目录下生成：
 
-# Create classifier instance
-classifier = ImageClassifier()
+- `results/classification_result.png` - 分级结果图
+- `visualization/result_with_legend.png` - 带图例的结果图
+- `results/processing_summary.json` - 处理统计报告
+- `classified/` - 分类后的切片文件
+- `severity_graded/` - 分级后的切片文件
+- `tiles/` - 原始切片文件
 
-# Load trained model
-classifier.load_model('disease_classifier_model.pth')
+## 颜色编码
 
-# Predict single spectral image
-result, confidence = classifier.predict_single_image('path/to/your/image.tif')
-print(f"Prediction result: {result}, Confidence: {confidence:.4f}")
-```
+- **白色**: 无效区域（nodata）
+- **绿色**: 健康区域
+- **红色系**: 疾病区域（不同深度代表不同严重程度类别）
 
-## Model Architecture
+## 当前限制与改进方向
 
-The model uses the following architecture:
+### 1. 分级效果问题
 
-- **Input Layer**: 224x224x3 RGB spectral images
-- **Convolutional Layers**: 4 convolutional blocks, each containing convolution, batch normalization, max pooling and Dropout
-- **Fully Connected Layers**: Two fully connected layers with Dropout regularization
-- **Output Layer**: Sigmoid activation function for binary classification
+**当前分级效果不佳的主要原因：**
+- 分级训练时未屏蔽背景噪音
+- 有无背景噪音的样本被拉大了特征距离
+- 导致模型学习到了背景特征而非病害特征
 
-## Performance Metrics
+**改进方案：**
+- 在训练严重程度分级器时，需要预处理数据以屏蔽背景噪音
+- 使用掩码技术只关注前景病害区域
+- 数据增强时保持背景一致性
 
-After training completion, the system automatically generates:
+### 2. 分级语义对齐
 
-1. **Accuracy Report**: Shows accuracy on test set
-2. **Classification Report**: Includes precision, recall, F1-score
-3. **Confusion Matrix**: Visualizes classification results
-4. **Training History**: Shows accuracy and loss changes during training
+**当前状态：**
+- 6个等级（Level_1 到 Level_6）仅代表不同类别
+- 等级间没有明确的严重程度顺序关系
 
-## Data Requirements
+**后续工作：**
+- 进行语义对齐，建立等级间的有序关系
+- 重新标注数据，确保等级反映真实的严重程度
+- 使用序数回归等技术改进模型
 
-- Supports TIFF format spectral images
-- Images are automatically resized to 224x224 pixels
-- Automatic conversion to RGB format (if original is grayscale)
-- Data is automatically normalized to [0,1] range
+## 技术特点
 
-## Custom Configuration
+1. **智能无效区域处理**：自动检测TIFF文件中的nodata值，避免无效区域参与计算
+2. **内存优化**：大图像切片处理，支持任意尺寸输入
+3. **模型复用**：支持预训练模型加载，避免重复训练
+4. **完整流水线**：从原始图像到最终可视化的一站式处理
+5. **详细统计**：提供完整的处理统计和性能指标
 
-You can customize by modifying the `ImageClassifier` class parameters:
+## 性能优化
 
-```python
-# Custom image size and data path
-classifier = ImageClassifier(
-    data_dir='your_data_path',
-    img_size=(256, 256)  # Custom image size
-)
+- 无效切片跳过：大幅减少计算量（从6270个切片减少到约2814个有效切片）
+- GPU加速：支持CUDA加速推理
+- 批处理：支持批量图像处理
+- 进度显示：实时显示处理进度
 
-# Custom training parameters
-history, X_test, y_test = classifier.train_model(
-    X, y, 
-    test_size=0.3,      # Test set ratio
-    epochs=50,          # Training epochs
-    batch_size=16       # Batch size
-)
-```
+## 注意事项
 
-## Notes
+1. 确保输入图像为多光谱TIFF格式
+2. 首次运行需要训练模型，后续可直接使用预训练模型
+3. 建议使用GPU加速以提高处理速度
+4. 输出目录会自动创建，注意磁盘空间
 
-1. Ensure sufficient GPU memory (8GB+ recommended)
-2. Training time depends on data volume and hardware configuration
-3. Model file size is approximately tens of MB
-4. Recommend backing up original data before training
+## 开发者信息
 
-## Troubleshooting
+本项目使用PyTorch框架开发，支持Python 3.7+环境。如有问题或建议，请联系开发团队。
 
-**Issue**: Out of memory error
-**Solution**: Reduce batch_size or image size
+---
 
-**Issue**: Image loading failure
-**Solution**: Check if image file format and path are correct
-
-**Issue**: Poor model performance
-**Solution**: Try increasing training epochs or adjusting model architecture
-
-## Technology Stack
-
-- **PyTorch**: Deep learning framework
-- **torchvision**: Computer vision tools
-- **scikit-learn**: Machine learning tools
-- **PIL/Pillow**: Image processing
-- **matplotlib/seaborn**: Data visualization
-- **NumPy**: Numerical computing
-- **tqdm**: Progress bar display
-
-## License
-
-This project is for learning and research purposes only.
+**版本**: v1.0  
+**最后更新**: 2025-07-30
