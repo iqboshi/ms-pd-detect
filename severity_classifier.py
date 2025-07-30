@@ -89,7 +89,7 @@ class SeverityDataset(Dataset):
                             image_array = np.concatenate([image_array, last_channel], axis=2)
                     
                     # 确保数据类型正确
-                    if image_array.dtype != np.uint8:
+                    if str(image_array.dtype) != 'uint8':
                         # 归一化到0-255
                         image_array = ((image_array - image_array.min()) / 
                                      (image_array.max() - image_array.min() + 1e-8) * 255).astype(np.uint8)
@@ -169,11 +169,12 @@ class SeverityDataset(Dataset):
 class SeverityClassifier:
     """疾病严重程度分级器"""
     
-    def __init__(self, data_dir='data', n_levels=6, img_size=(64, 64), device=None, output_dir=None):
+    def __init__(self, data_dir='data', n_levels=6, img_size=(64, 64), device=None, output_dir=None, lazy_init=False):
         self.data_dir = data_dir
         self.n_levels = n_levels
         self.img_size = img_size
         self.device = device if device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.lazy_init = lazy_init
         
         # 创建输出目录
         if output_dir is None:
@@ -181,11 +182,15 @@ class SeverityClassifier:
             self.output_dir = os.path.join('outputs', f'severity_run_{timestamp}')
         else:
             self.output_dir = output_dir
-        os.makedirs(os.path.join(self.output_dir, 'models'), exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, 'plots'), exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, 'logs'), exist_ok=True)
         
-        print(f"输出目录已创建: {self.output_dir}")
+        # 根据lazy_init决定是否立即创建目录
+        if not lazy_init:
+            self._ensure_output_dirs()
+        else:
+            # 只创建主输出目录
+            os.makedirs(self.output_dir, exist_ok=True)
+            print(f"输出目录已创建: {self.output_dir} (lazy initialization)")
+        
         print(f"设备: {self.device}")
         print(f"严重程度级别数: {n_levels}")
         
@@ -194,6 +199,14 @@ class SeverityClassifier:
         
         self.model = None
         self.severity_levels = [f"Level_{i+1}" for i in range(n_levels)]
+    
+    def _ensure_output_dirs(self):
+        """确保输出目录存在（按需创建）"""
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'models'), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'plots'), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'logs'), exist_ok=True)
+        print(f"输出目录已创建: {self.output_dir}")
         
     def set_random_seeds(self, seed=42):
         """设置随机种子以确保结果可重现"""
@@ -255,7 +268,7 @@ class SeverityClassifier:
                             img_array = np.stack([img_array] * 3, axis=-1)
                         
                         # 确保数据类型正确
-                        if img_array.dtype != np.uint8:
+                        if str(img_array.dtype) != 'uint8':
                             # 归一化到0-255
                             img_array = ((img_array - img_array.min()) / 
                                        (img_array.max() - img_array.min() + 1e-8) * 255).astype(np.uint8)
@@ -353,52 +366,139 @@ class SeverityClassifier:
         return labels, thresholds
     
     def create_model(self):
-        """创建CNN模型用于严重程度分类"""
-        class SeverityCNN(nn.Module):
-            def __init__(self, num_classes, img_size):
-                super(SeverityCNN, self).__init__()
-                
-                # 卷积层
-                self.conv1 = nn.Conv2d(5, 32, 3, padding=1)
-                self.bn1 = nn.BatchNorm2d(32)
-                self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
-                self.bn2 = nn.BatchNorm2d(64)
-                self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
-                self.bn3 = nn.BatchNorm2d(128)
-                
-                self.pool = nn.MaxPool2d(2, 2)
-                self.dropout = nn.Dropout(0.5)
-                
-                # 计算全连接层输入大小
-                conv_output_size = (img_size[0] // 8) * (img_size[1] // 8) * 128
-                
-                # 全连接层
-                self.fc1 = nn.Linear(conv_output_size, 256)
-                self.fc2 = nn.Linear(256, 128)
-                self.fc3 = nn.Linear(128, num_classes)
-                
-                self.relu = nn.ReLU()
+        """创建基于对比学习的特征提取模型（优化版，减少土壤阴影等干扰）"""
+        class SpatialAttention(nn.Module):
+            """空间注意力机制，帮助模型关注重要区域"""
+            def __init__(self, in_channels):
+                super(SpatialAttention, self).__init__()
+                self.conv = nn.Conv2d(in_channels, 1, kernel_size=1)
+                self.sigmoid = nn.Sigmoid()
                 
             def forward(self, x):
-                # 卷积块1
-                x = self.pool(self.relu(self.bn1(self.conv1(x))))
-                # 卷积块2
-                x = self.pool(self.relu(self.bn2(self.conv2(x))))
-                # 卷积块3
-                x = self.pool(self.relu(self.bn3(self.conv3(x))))
-                
-                # 展平
-                x = x.view(x.size(0), -1)
-                
-                # 全连接层
-                x = self.dropout(self.relu(self.fc1(x)))
-                x = self.dropout(self.relu(self.fc2(x)))
-                x = self.fc3(x)
-                
-                return x
+                attention = self.conv(x)
+                attention = self.sigmoid(attention)
+                return x * attention
         
-        self.model = SeverityCNN(self.n_levels, self.img_size).to(self.device)
-        print(f"\n模型结构:")
+        class ChannelAttention(nn.Module):
+            """通道注意力机制，强调重要的光谱通道"""
+            def __init__(self, in_channels, reduction=16):
+                super(ChannelAttention, self).__init__()
+                self.avg_pool = nn.AdaptiveAvgPool2d(1)
+                self.max_pool = nn.AdaptiveMaxPool2d(1)
+                self.fc = nn.Sequential(
+                    nn.Linear(in_channels, in_channels // reduction),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(in_channels // reduction, in_channels)
+                )
+                self.sigmoid = nn.Sigmoid()
+                
+            def forward(self, x):
+                b, c, h, w = x.size()
+                avg_out = self.fc(self.avg_pool(x).view(b, c))
+                max_out = self.fc(self.max_pool(x).view(b, c))
+                attention = self.sigmoid(avg_out + max_out).view(b, c, 1, 1)
+                return x * attention
+        
+        class EnhancedContrastiveEncoder(nn.Module):
+            def __init__(self, img_size, feature_dim=128):
+                super(EnhancedContrastiveEncoder, self).__init__()
+                
+                # 多尺度特征提取
+                # 第一个卷积块 - 保留细节
+                self.conv1 = nn.Sequential(
+                    nn.Conv2d(5, 64, 3, padding=1),
+                    nn.BatchNorm2d(64),
+                    nn.ReLU(inplace=True),
+                    ChannelAttention(64),
+                    SpatialAttention(64)
+                )
+                
+                # 第二个卷积块
+                self.conv2 = nn.Sequential(
+                    nn.Conv2d(64, 128, 3, padding=1),
+                    nn.BatchNorm2d(128),
+                    nn.ReLU(inplace=True),
+                    ChannelAttention(128),
+                    SpatialAttention(128)
+                )
+                
+                # 第三个卷积块
+                self.conv3 = nn.Sequential(
+                    nn.Conv2d(128, 256, 3, padding=1),
+                    nn.BatchNorm2d(256),
+                    nn.ReLU(inplace=True),
+                    ChannelAttention(256),
+                    SpatialAttention(256)
+                )
+                
+                # 第四个卷积块
+                self.conv4 = nn.Sequential(
+                    nn.Conv2d(256, 512, 3, padding=1),
+                    nn.BatchNorm2d(512),
+                    nn.ReLU(inplace=True),
+                    ChannelAttention(512),
+                    SpatialAttention(512)
+                )
+                
+                self.pool = nn.MaxPool2d(2, 2)
+                self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
+                
+                # 多尺度特征融合
+                self.feature_fusion = nn.Sequential(
+                    nn.Linear(512 + 256 + 128, 512),  # 融合多层特征
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(0.3)
+                )
+                
+                # 投影头用于对比学习
+                self.projection_head = nn.Sequential(
+                    nn.Linear(512, 256),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(0.2),
+            nn.Linear(256, feature_dim)
+            # L2归一化在forward中实现
+                )
+                
+            def forward(self, x):
+                # 多尺度特征提取
+                x1 = self.conv1(x)
+                x1_pool = self.pool(x1)
+                
+                x2 = self.conv2(x1_pool)
+                x2_pool = self.pool(x2)
+                
+                x3 = self.conv3(x2_pool)
+                x3_pool = self.pool(x3)
+                
+                x4 = self.conv4(x3_pool)
+                
+                # 全局平均池化
+                feat4 = self.adaptive_pool(x4).view(x4.size(0), -1)
+                feat3 = self.adaptive_pool(x3).view(x3.size(0), -1)
+                feat2 = self.adaptive_pool(x2).view(x2.size(0), -1)
+                
+                # 多尺度特征融合
+                fused_features = torch.cat([feat4, feat3, feat2], dim=1)
+                features = self.feature_fusion(fused_features)
+                
+                # 投影到对比学习空间
+                projections = self.projection_head(features)
+                # L2归一化
+                projections = nn.functional.normalize(projections, p=2, dim=1)
+                
+                return features, projections
+        
+        # 添加L2Norm层
+        class L2Norm(nn.Module):
+            def __init__(self, dim=1):
+                super(L2Norm, self).__init__()
+                self.dim = dim
+                
+            def forward(self, x):
+                return nn.functional.normalize(x, p=2, dim=self.dim)
+        
+        self.model = EnhancedContrastiveEncoder(self.img_size, feature_dim=128).to(self.device)
+        print(f"\n增强对比学习模型结构（抗干扰优化版）:")
         print(self.model)
         
         # 计算参数数量
@@ -406,44 +506,276 @@ class SeverityClassifier:
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"\n总参数数: {total_params:,}")
         print(f"可训练参数数: {trainable_params:,}")
+        print(f"模型优化特性: 空间注意力 + 通道注意力 + 多尺度特征融合")
         
-    def prepare_data(self, image_paths, labels, train_ratio=0.8):
-        """准备训练和验证数据"""
-        # 数据增强
-        train_transform = transforms.Compose([
+    def create_vegetation_mask(self, image_array):
+        """创建高级植被掩码，使用多光谱指数和自适应阈值"""
+        if image_array.shape[2] >= 5:
+            # 获取各波段（蓝、绿、红、红边、近红外）
+            blue = image_array[:, :, 0].astype(np.float32)
+            green = image_array[:, :, 1].astype(np.float32)
+            red = image_array[:, :, 2].astype(np.float32)
+            red_edge = image_array[:, :, 3].astype(np.float32)
+            nir = image_array[:, :, 4].astype(np.float32)
+            
+            # 计算多种植被指数
+            # 1. NDVI (归一化植被指数)
+            ndvi = (nir - red) / (nir + red + 1e-8)
+            
+            # 2. EVI (增强植被指数) - 减少土壤和大气影响
+            evi = 2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1)
+            
+            # 3. SAVI (土壤调节植被指数) - 专门处理土壤背景
+            L = 0.5  # 土壤亮度校正因子
+            savi = ((nir - red) / (nir + red + L)) * (1 + L)
+            
+            # 4. NDRE (归一化红边指数) - 对叶绿素敏感
+            ndre = (nir - red_edge) / (nir + red_edge + 1e-8)
+            
+            # 5. GNDVI (绿色归一化植被指数)
+            gndvi = (nir - green) / (nir + green + 1e-8)
+            
+            # 综合植被分数（加权组合）
+            vegetation_score = (
+                0.3 * np.clip(ndvi, 0, 1) +
+                0.25 * np.clip(evi, 0, 1) +
+                0.2 * np.clip(savi, 0, 1) +
+                0.15 * np.clip(ndre, 0, 1) +
+                0.1 * np.clip(gndvi, 0, 1)
+            )
+            
+            # 使用自适应阈值（Otsu方法的简化版）
+            hist, bins = np.histogram(vegetation_score.flatten(), bins=50, range=(0, 1))
+            hist = hist.astype(np.float32)
+            
+            # 计算类间方差最大的阈值
+            total = vegetation_score.size
+            current_max = 0
+            threshold = 0
+            sum_total = np.sum(np.arange(len(hist)) * hist)
+            sum_background = 0
+            weight_background = 0
+            
+            for i in range(len(hist)):
+                weight_background += hist[i]
+                if weight_background == 0:
+                    continue
+                    
+                weight_foreground = total - weight_background
+                if weight_foreground == 0:
+                    break
+                    
+                sum_background += i * hist[i]
+                mean_background = sum_background / weight_background
+                mean_foreground = (sum_total - sum_background) / weight_foreground
+                
+                # 类间方差
+                variance_between = weight_background * weight_foreground * (mean_background - mean_foreground) ** 2
+                
+                if variance_between > current_max:
+                    current_max = variance_between
+                    threshold = bins[i]
+            
+            # 如果自适应阈值失败，使用固定阈值
+            if threshold <= 0:
+                threshold = 0.4
+            
+            vegetation_mask = vegetation_score > threshold
+            
+            # 亮度和纹理过滤
+            brightness = np.mean(image_array[:, :, :3], axis=2)
+            brightness_threshold = np.percentile(brightness, 15)
+            brightness_mask = brightness > brightness_threshold
+            
+            # 组合掩码
+            combined_mask = vegetation_mask & brightness_mask
+            
+            return combined_mask.astype(np.uint8) * 255
+        else:
+            # 简化版本：仅使用RGB通道
+            if image_array.shape[2] >= 3:
+                red = image_array[:, :, 0].astype(np.float32)
+                green = image_array[:, :, 1].astype(np.float32)
+                blue = image_array[:, :, 2].astype(np.float32)
+                
+                # 使用绿色比例和亮度
+                green_ratio = green / (red + green + blue + 1e-8)
+                brightness = (red + green + blue) / 3
+                
+                # 植被通常有较高的绿色比例
+                green_mask = green_ratio > 0.35
+                brightness_mask = brightness > np.percentile(brightness, 25)
+                
+                combined_mask = green_mask & brightness_mask
+            else:
+                # 灰度图像：仅使用亮度阈值
+                brightness = image_array.squeeze() if len(image_array.shape) == 3 else image_array
+                threshold = np.percentile(brightness, 30)
+                combined_mask = brightness > threshold
+            
+            return combined_mask.astype(np.uint8) * 255
+    
+    def spectral_augmentation(self, image_array):
+        """光谱增强，强调植被特征"""
+        if image_array.shape[2] >= 5:
+            # 增强红边和近红外通道对比
+            enhanced = image_array.copy().astype(np.float32)
+            
+            # 轻微增强红边通道（索引3）
+            enhanced[:, :, 3] = np.clip(enhanced[:, :, 3] * 1.1, 0, 255)
+            
+            # 轻微增强近红外通道（索引4）
+            enhanced[:, :, 4] = np.clip(enhanced[:, :, 4] * 1.05, 0, 255)
+            
+            # 轻微减弱蓝色通道（减少土壤反射）
+            enhanced[:, :, 0] = np.clip(enhanced[:, :, 0] * 0.95, 0, 255)
+            
+            return enhanced.astype(np.uint8)
+        return image_array
+    
+    def create_contrastive_augmentations(self):
+        """创建对比学习的数据增强策略（优化版，减少干扰）"""
+        # 强增强：用于创建正样本对，加入植被关注机制
+        strong_augment = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(degrees=15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.RandomRotation(degrees=15),  # 减少旋转角度
+            transforms.ColorJitter(brightness=0.2, contrast=0.3, saturation=0.2, hue=0.1),  # 减少颜色变化
+            transforms.RandomResizedCrop(self.img_size, scale=(0.85, 1.0)),  # 减少裁剪范围
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),  # 减少模糊程度
         ])
         
-        val_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # 弱增强：用于基础变换，更保守
+        weak_augment = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.3),
+            transforms.ColorJitter(brightness=0.05, contrast=0.05),  # 非常轻微的颜色变化
         ])
         
-        # 分割数据
-        indices = list(range(len(image_paths)))
-        np.random.shuffle(indices)
+        # 标准化（针对5通道优化）
+        normalize = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406, 0.485, 0.456], 
+                               std=[0.229, 0.224, 0.225, 0.229, 0.224])
+        ])
         
-        split_idx = int(len(indices) * train_ratio)
-        train_indices = indices[:split_idx]
-        val_indices = indices[split_idx:]
+        return strong_augment, weak_augment, normalize
+    
+    def prepare_contrastive_data(self, image_paths):
+        """准备对比学习数据（无需标签）"""
+        strong_aug, weak_aug, normalize = self.create_contrastive_augmentations()
         
-        train_paths = [image_paths[i] for i in train_indices]
-        train_labels = [labels[i] for i in train_indices]
-        val_paths = [image_paths[i] for i in val_indices]
-        val_labels = [labels[i] for i in val_indices]
+        # 对比学习数据集
+        class ContrastiveDataset(Dataset):
+            def __init__(self, image_paths, strong_transform, weak_transform, normalize_transform, img_size):
+                self.image_paths = image_paths
+                self.strong_transform = strong_transform
+                self.weak_transform = weak_transform
+                self.normalize = normalize_transform
+                self.img_size = img_size
+                
+            def __len__(self):
+                return len(self.image_paths)
+                
+            def __getitem__(self, idx):
+                image_path = self.image_paths[idx]
+                
+                # 加载图像（复用原有的5通道加载逻辑）
+                try:
+                    if image_path.lower().endswith(('.tif', '.tiff')):
+                        if tifffile is not None:
+                            import sys, io
+                            old_stderr = sys.stderr
+                            sys.stderr = io.StringIO()
+                            try:
+                                image_array = tifffile.imread(image_path)
+                            finally:
+                                sys.stderr = old_stderr
+                            
+                            # 处理为5通道
+                            if len(image_array.shape) == 3 and image_array.shape[2] >= 5:
+                                image_array = image_array[:, :, :5]
+                            elif len(image_array.shape) == 3 and image_array.shape[2] == 3:
+                                red_edge = image_array[:, :, 0:1]
+                                nir = image_array[:, :, 1:2]
+                                image_array = np.concatenate([image_array, red_edge, nir], axis=2)
+                            elif len(image_array.shape) == 2:
+                                image_array = np.stack([image_array] * 5, axis=-1)
+                            
+                            if str(image_array.dtype) != 'uint8':
+                                image_array = ((image_array - image_array.min()) / 
+                                             (image_array.max() - image_array.min() + 1e-8) * 255).astype(np.uint8)
+                            
+                            image_array = cv2.resize(image_array, self.img_size)
+                            
+                            # 转换为PIL图像用于数据增强（仅使用前3通道）
+                            pil_image = Image.fromarray(image_array[:, :, :3])
+                        else:
+                            pil_image = Image.open(image_path).convert('RGB')
+                            pil_image = pil_image.resize(self.img_size)
+                    else:
+                        pil_image = Image.open(image_path).convert('RGB')
+                        pil_image = pil_image.resize(self.img_size)
+                    
+                    # 应用光谱增强（在PIL变换之前）
+                    if hasattr(self, 'parent_classifier'):
+                        image_array = self.parent_classifier.spectral_augmentation(image_array)
+                        pil_image = Image.fromarray(image_array[:, :, :3])
+                    
+                    # 生成两个不同的增强版本（正样本对）
+                    aug1 = self.strong_transform(pil_image)
+                    aug2 = self.weak_transform(pil_image)
+                    
+                    # 转换为5通道tensor（改进版）
+                    def to_5channel_tensor_enhanced(pil_img, original_5ch=None):
+                        img_array = np.array(pil_img)
+                        
+                        if original_5ch is not None:
+                            # 使用原始5通道数据的后两个通道
+                            red_edge = original_5ch[:, :, 3:4]
+                            nir = original_5ch[:, :, 4:5]
+                        else:
+                            # 回退方案：从RGB估算
+                            red_edge = img_array[:, :, 0:1]  # 使用红色通道
+                            nir = img_array[:, :, 1:2]       # 使用绿色通道
+                        
+                        img_5ch = np.concatenate([img_array, red_edge, nir], axis=2)
+                        
+                        # 创建植被掩码（如果可能）
+                        if hasattr(self, 'parent_classifier') and img_5ch.shape[2] >= 5:
+                            mask = self.parent_classifier.create_vegetation_mask(img_5ch)
+                            # 将掩码应用为权重（软掩码）
+                            mask_weight = mask.astype(np.float32) / 255.0
+                            mask_weight = np.expand_dims(mask_weight, axis=2)
+                            # 增强植被区域，减弱非植被区域
+                            img_5ch = img_5ch * (0.3 + 0.7 * mask_weight)
+                        
+                        img_tensor = torch.from_numpy(img_5ch).permute(2, 0, 1).float() / 255.0
+                        # 应用归一化
+                        mean = torch.tensor([0.485, 0.456, 0.406, 0.485, 0.456]).view(5, 1, 1)
+                        std = torch.tensor([0.229, 0.224, 0.225, 0.229, 0.224]).view(5, 1, 1)
+                        return (img_tensor - mean) / std
+                    
+                    # 传递原始5通道数据用于更好的特征保持
+                    original_5ch = image_array if image_array.shape[2] >= 5 else None
+                    aug1_tensor = to_5channel_tensor_enhanced(aug1, original_5ch)
+                    aug2_tensor = to_5channel_tensor_enhanced(aug2, original_5ch)
+                    
+                    return aug1_tensor, aug2_tensor, idx
+                    
+                except Exception as e:
+                    print(f"Error loading image {image_path}: {e}")
+                    # 返回随机tensor
+                    dummy = torch.randn(5, *self.img_size)
+                    return dummy, dummy, idx
         
-        # 创建数据集
-        train_dataset = SeverityDataset(train_paths, train_labels, train_transform, self.img_size)
-        val_dataset = SeverityDataset(val_paths, val_labels, val_transform, self.img_size)
+        # 创建对比学习数据集
+        strong_aug, weak_aug, normalize = self.create_contrastive_augmentations()
+        contrastive_dataset = ContrastiveDataset(image_paths, strong_aug, weak_aug, normalize, self.img_size)
+        # 添加parent_classifier引用以使用植被掩码和光谱增强
+        contrastive_dataset.parent_classifier = self
+        contrastive_loader = DataLoader(contrastive_dataset, batch_size=32, shuffle=True, num_workers=0)
         
-        # 创建数据加载器
-        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=0)
-        val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=0)
+        return contrastive_loader
         
         print(f"\n数据分割:")
         print(f"训练集: {len(train_dataset)} 张图像")
@@ -451,127 +783,278 @@ class SeverityClassifier:
         
         return train_loader, val_loader
     
-    def train_model(self, train_loader, val_loader, epochs=50, learning_rate=0.001):
-        """训练模型"""
-        criterion = nn.CrossEntropyLoss()
+    def contrastive_loss(self, features1, features2, temperature=0.07, hard_negative_weight=1.0):
+        """计算改进的InfoNCE对比学习损失（抗干扰优化版）"""
+        batch_size = features1.size(0)
+        
+        # L2归一化
+        features1 = nn.functional.normalize(features1, dim=1)
+        features2 = nn.functional.normalize(features2, dim=1)
+        
+        # 计算相似度矩阵
+        similarity_matrix = torch.matmul(features1, features2.T) / temperature
+        
+        # 创建标签（对角线为正样本）
+        labels = torch.arange(batch_size).to(self.device)
+        
+        # 基础InfoNCE损失
+        base_loss = nn.functional.cross_entropy(similarity_matrix, labels)
+        
+        # 困难负样本挖掘：增加对困难负样本的关注
+        if hard_negative_weight > 1.0:
+            # 获取负样本相似度（非对角线元素）
+            mask = torch.eye(batch_size, device=self.device).bool()
+            negative_similarities = similarity_matrix.masked_fill(mask, float('-inf'))
+            
+            # 找到最困难的负样本（相似度最高的负样本）
+            hard_negatives, _ = torch.max(negative_similarities, dim=1)
+            
+            # 计算困难负样本损失
+            positive_similarities = torch.diag(similarity_matrix)
+            hard_negative_loss = torch.mean(torch.relu(hard_negatives - positive_similarities + 0.2))
+            
+            # 组合损失
+            total_loss = base_loss + hard_negative_weight * hard_negative_loss
+        else:
+            total_loss = base_loss
+        
+        return total_loss
+    
+    def train_contrastive_model(self, contrastive_loader, epochs=100, learning_rate=0.001):
+        """训练对比学习模型"""
         optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, verbose=True)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         
-        train_losses = []
-        train_accuracies = []
-        val_losses = []
-        val_accuracies = []
-        
-        best_val_acc = 0.0
-        patience_counter = 0
-        patience = 10
-        
-        print(f"\n开始训练 {epochs} 个epoch...")
-        
-        for epoch in range(epochs):
-            # 训练阶段
-            self.model.train()
-            running_loss = 0.0
-            correct_train = 0
-            total_train = 0
-            
-            train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs} [Train]')
-            for images, labels in train_pbar:
-                images, labels = images.to(self.device), labels.to(self.device)
-                
-                optimizer.zero_grad()
-                outputs = self.model(images)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-                
-                running_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                total_train += labels.size(0)
-                correct_train += (predicted == labels).sum().item()
-                
-                train_pbar.set_postfix({
-                    'Loss': f'{loss.item():.4f}',
-                    'Acc': f'{100.*correct_train/total_train:.2f}%'
-                })
-            
-            train_loss = running_loss / len(train_loader)
-            train_acc = 100. * correct_train / total_train
-            
-            # 验证阶段
-            self.model.eval()
-            val_loss = 0.0
-            correct_val = 0
-            total_val = 0
-            
-            with torch.no_grad():
-                val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{epochs} [Val]')
-                for images, labels in val_pbar:
-                    images, labels = images.to(self.device), labels.to(self.device)
-                    outputs = self.model(images)
-                    loss = criterion(outputs, labels)
-                    
-                    val_loss += loss.item()
-                    _, predicted = torch.max(outputs, 1)
-                    total_val += labels.size(0)
-                    correct_val += (predicted == labels).sum().item()
-                    
-                    val_pbar.set_postfix({
-                        'Loss': f'{loss.item():.4f}',
-                        'Acc': f'{100.*correct_val/total_val:.2f}%'
-                    })
-            
-            val_loss = val_loss / len(val_loader)
-            val_acc = 100. * correct_val / total_val
-            
-            # 记录历史
-            train_losses.append(train_loss)
-            train_accuracies.append(train_acc)
-            val_losses.append(val_loss)
-            val_accuracies.append(val_acc)
-            
-            # 学习率调度
-            scheduler.step(val_acc)
-            
-            print(f'Epoch [{epoch+1}/{epochs}]:')
-            print(f'  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-            print(f'  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
-            
-            # 保存最佳模型
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                patience_counter = 0
-                best_model_path = os.path.join(self.output_dir, 'models', 'best_severity_model.pth')
-                torch.save({
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'epoch': epoch,
-                    'val_acc': val_acc,
-                    'n_levels': self.n_levels,
-                    'img_size': self.img_size,
-                    'severity_levels': self.severity_levels
-                }, best_model_path)
-                print(f'  新的最佳模型已保存! 验证准确率: {val_acc:.2f}%')
-            else:
-                patience_counter += 1
-                
-            # 早停
-            if patience_counter >= patience:
-                print(f'\n早停触发! {patience} 个epoch没有改善')
-                break
-                
-            print('-' * 60)
-        
-        # 保存训练历史
         history = {
-            'train_losses': train_losses,
-            'train_accuracies': train_accuracies,
-            'val_losses': val_losses,
-            'val_accuracies': val_accuracies,
-            'best_val_acc': best_val_acc
+            'contrastive_loss': [],
+            'lr': []
         }
         
+        print(f"\n开始对比学习训练，共{epochs}个epoch")
+        print(f"学习率: {learning_rate}")
+        print(f"设备: {self.device}")
+        
+        for epoch in range(epochs):
+            self.model.train()
+            total_loss = 0.0
+            num_batches = 0
+            
+            train_pbar = tqdm(contrastive_loader, desc=f'Epoch {epoch+1}/{epochs} [Contrastive]')
+            for batch_idx, (aug1, aug2, _) in enumerate(train_pbar):
+                aug1, aug2 = aug1.to(self.device), aug2.to(self.device)
+                
+                optimizer.zero_grad()
+                
+                # 前向传播
+                features1, projections1 = self.model(aug1)
+                features2, projections2 = self.model(aug2)
+                
+                # 计算改进的对比损失（包含困难负样本挖掘）
+                # 在训练初期使用较低的困难负样本权重，后期逐渐增加
+                hard_neg_weight = 1.0 + 0.5 * (epoch / epochs)  # 从1.0增加到1.5
+                loss = self.contrastive_loss(projections1, projections2, 
+                                            temperature=0.07, 
+                                            hard_negative_weight=hard_neg_weight)
+                
+                loss.backward()
+                
+                # 梯度裁剪防止梯度爆炸
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+                # 更新进度条
+                train_pbar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Avg Loss': f'{total_loss/num_batches:.4f}'
+                })
+            
+            # 计算平均损失
+            avg_loss = total_loss / num_batches
+            
+            # 记录历史
+            history['contrastive_loss'].append(avg_loss)
+            history['lr'].append(optimizer.param_groups[0]['lr'])
+            
+            print(f'\nEpoch {epoch+1}/{epochs}:')
+            print(f'Contrastive Loss: {avg_loss:.4f}')
+            print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+            
+            # 每10个epoch保存一次模型
+            if (epoch + 1) % 10 == 0:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_loss
+                }, os.path.join(self.output_dir, 'models', f'contrastive_model_epoch_{epoch+1}.pth'))
+                print(f'模型已保存: epoch_{epoch+1}')
+                
+            scheduler.step()
+            print('-' * 60)
+        
+        # 保存最终模型
+        torch.save({
+            'epoch': epochs,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'final_loss': avg_loss
+        }, os.path.join(self.output_dir, 'models', 'final_contrastive_model.pth'))
+        
+        print(f'\n对比学习训练完成! 最终损失: {avg_loss:.4f}')
         return history
+    
+    def extract_features(self, image_paths):
+        """提取所有图像的特征用于聚类"""
+        self.model.eval()
+        features_list = []
+        
+        # 创建简单的数据加载器用于特征提取
+        class FeatureDataset(Dataset):
+            def __init__(self, image_paths, img_size):
+                self.image_paths = image_paths
+                self.img_size = img_size
+                
+            def __len__(self):
+                return len(self.image_paths)
+                
+            def __getitem__(self, idx):
+                image_path = self.image_paths[idx]
+                
+                try:
+                    if image_path.lower().endswith(('.tif', '.tiff')):
+                        if tifffile is not None:
+                            import sys, io
+                            old_stderr = sys.stderr
+                            sys.stderr = io.StringIO()
+                            try:
+                                image_array = tifffile.imread(image_path)
+                            finally:
+                                sys.stderr = old_stderr
+                            
+                            # 处理为5通道
+                            if len(image_array.shape) == 3 and image_array.shape[2] >= 5:
+                                image_array = image_array[:, :, :5]
+                            elif len(image_array.shape) == 3 and image_array.shape[2] == 3:
+                                red_edge = image_array[:, :, 0:1]
+                                nir = image_array[:, :, 1:2]
+                                image_array = np.concatenate([image_array, red_edge, nir], axis=2)
+                            elif len(image_array.shape) == 2:
+                                image_array = np.stack([image_array] * 5, axis=-1)
+                            
+                            if str(image_array.dtype) != 'uint8':
+                                image_array = ((image_array - image_array.min()) / 
+                                             (image_array.max() - image_array.min() + 1e-8) * 255).astype(np.uint8)
+                            
+                            image_array = cv2.resize(image_array, self.img_size)
+                        else:
+                            pil_image = Image.open(image_path).convert('RGB')
+                            pil_image = pil_image.resize(self.img_size)
+                            image_array = np.array(pil_image)
+                            red_edge = image_array[:, :, 0:1]
+                            nir = image_array[:, :, 1:2]
+                            image_array = np.concatenate([image_array, red_edge, nir], axis=2)
+                    else:
+                        pil_image = Image.open(image_path).convert('RGB')
+                        pil_image = pil_image.resize(self.img_size)
+                        image_array = np.array(pil_image)
+                        red_edge = image_array[:, :, 0:1]
+                        nir = image_array[:, :, 1:2]
+                        image_array = np.concatenate([image_array, red_edge, nir], axis=2)
+                    
+                    # 转换为tensor并归一化
+                    image_tensor = torch.from_numpy(image_array).permute(2, 0, 1).float() / 255.0
+                    mean = torch.tensor([0.485, 0.456, 0.406, 0.485, 0.456]).view(5, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225, 0.229, 0.224]).view(5, 1, 1)
+                    image_tensor = (image_tensor - mean) / std
+                    
+                    return image_tensor, idx
+                    
+                except Exception as e:
+                    print(f"Error loading image {image_path}: {e}")
+                    return torch.randn(5, *self.img_size), idx
+        
+        feature_dataset = FeatureDataset(image_paths, self.img_size)
+        feature_loader = DataLoader(feature_dataset, batch_size=32, shuffle=False, num_workers=0)
+        
+        print("\n提取图像特征用于聚类...")
+        with torch.no_grad():
+            for images, indices in tqdm(feature_loader, desc="提取特征"):
+                images = images.to(self.device)
+                features, _ = self.model(images)
+                features_list.append(features.cpu().numpy())
+        
+        # 合并所有特征
+        all_features = np.concatenate(features_list, axis=0)
+        print(f"提取完成，特征维度: {all_features.shape}")
+        
+        return all_features
+    
+    def cluster_severity_levels(self, features, image_paths):
+        """使用K-means聚类将图像分为6个严重程度级别"""
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import PCA
+        
+        print(f"\n开始聚类分析，目标级别数: {self.n_levels}")
+        
+        # 标准化特征
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+        
+        # 可选：使用PCA降维以提高聚类效果
+        if features.shape[1] > 50:
+            pca = PCA(n_components=50, random_state=42)
+            features_scaled = pca.fit_transform(features_scaled)
+            print(f"PCA降维后特征维度: {features_scaled.shape}")
+        
+        # K-means聚类
+        kmeans = KMeans(n_clusters=self.n_levels, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(features_scaled)
+        
+        # 计算每个聚类中心到原点的距离，用于排序严重程度
+        cluster_centers = kmeans.cluster_centers_
+        center_distances = np.linalg.norm(cluster_centers, axis=1)
+        
+        # 根据距离排序聚类（距离越大，严重程度越高）
+        sorted_indices = np.argsort(center_distances)
+        
+        # 重新映射标签，使其按严重程度排序
+        severity_labels = np.zeros_like(cluster_labels)
+        for new_label, old_label in enumerate(sorted_indices):
+            severity_labels[cluster_labels == old_label] = new_label
+        
+        # 统计每个级别的数量
+        level_counts = np.bincount(severity_labels, minlength=self.n_levels)
+        
+        print("\n聚类结果统计:")
+        for i, count in enumerate(level_counts):
+            percentage = count / len(severity_labels) * 100
+            print(f"Level {i+1}: {count} 张图像 ({percentage:.1f}%)")
+        
+        # 保存聚类结果
+        clustering_results = {
+            'image_paths': image_paths,
+            'severity_labels': severity_labels.tolist(),
+            'level_counts': level_counts.tolist(),
+            'cluster_centers': cluster_centers.tolist(),
+            'scaler_params': {
+                'mean': scaler.mean_.tolist(),
+                'scale': scaler.scale_.tolist()
+            }
+        }
+        
+        # 保存到文件
+        results_path = os.path.join(self.output_dir, 'clustering_results.json')
+        with open(results_path, 'w', encoding='utf-8') as f:
+            json.dump(clustering_results, f, ensure_ascii=False, indent=2)
+        
+        print(f"\n聚类结果已保存到: {results_path}")
+        
+        return severity_labels, level_counts
     
     def plot_training_history(self, history):
         """绘制训练历史"""
@@ -723,7 +1206,7 @@ class SeverityClassifier:
                             img_array = np.stack([img_array] * 3, axis=-1)
                         
                         # 确保数据类型正确
-                        if img_array.dtype != np.uint8:
+                        if str(img_array.dtype) != 'uint8':
                             # 归一化到0-255
                             img_array = ((img_array - img_array.min()) / 
                                        (img_array.max() - img_array.min() + 1e-8) * 255).astype(np.uint8)
@@ -869,6 +1352,159 @@ class SeverityClassifier:
             print(f"训练过程中出现错误: {e}")
             import traceback
             traceback.print_exc()
+    
+    def run_contrastive_severity_classification(self, epochs=100, learning_rate=0.001):
+        """运行基于对比学习的无监督严重程度分级流程"""
+        try:
+            print("="*60)
+            print("开始基于对比学习的无监督疾病严重程度分级")
+            print("="*60)
+            
+            # 1. 加载diseased图像
+            image_paths = self.load_diseased_images()
+            
+            # 2. 创建对比学习模型
+            self.create_model()
+            
+            # 3. 准备对比学习数据（无需标签）
+            contrastive_loader = self.prepare_contrastive_data(image_paths)
+            
+            # 4. 训练对比学习模型
+            print("\n第一阶段：对比学习特征提取训练")
+            history = self.train_contrastive_model(contrastive_loader, epochs, learning_rate)
+            
+            # 5. 提取所有图像的特征
+            print("\n第二阶段：特征提取")
+            features = self.extract_features(image_paths)
+            
+            # 6. 使用聚类进行无监督分级
+            print("\n第三阶段：无监督聚类分级")
+            severity_labels, level_counts = self.cluster_severity_levels(features, image_paths)
+            
+            # 7. 绘制训练历史
+            self.plot_contrastive_history(history)
+            
+            # 8. 可视化聚类结果
+            self.visualize_clustering_results(features, severity_labels, image_paths)
+            
+            # 9. 保存训练日志
+            self.save_contrastive_log(history, level_counts, len(image_paths))
+            
+            print("\n" + "="*60)
+            print("基于对比学习的无监督严重程度分级完成!")
+            print(f"总图像数量: {len(image_paths)}")
+            print(f"聚类级别数: {self.n_levels}")
+            print(f"输出目录: {self.output_dir}")
+            print("="*60)
+            
+            return severity_labels, level_counts
+            
+        except Exception as e:
+            print(f"训练过程中出现错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
+    
+    def plot_contrastive_history(self, history):
+        """绘制对比学习训练历史"""
+        plt.figure(figsize=(12, 4))
+        
+        # 对比学习损失曲线
+        plt.subplot(1, 2, 1)
+        plt.plot(history['contrastive_loss'], label='Contrastive Loss', color='blue')
+        plt.title('Contrastive Learning Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        
+        # 学习率曲线
+        plt.subplot(1, 2, 2)
+        plt.plot(history['lr'], label='Learning Rate', color='green')
+        plt.title('Learning Rate Schedule')
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        
+        # 保存图像
+        plot_path = os.path.join(self.output_dir, 'plots', 'contrastive_training_history.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"对比学习训练历史图已保存到: {plot_path}")
+    
+    def visualize_clustering_results(self, features, labels, image_paths):
+        """可视化聚类结果"""
+        from sklearn.manifold import TSNE
+        from sklearn.decomposition import PCA
+        
+        print("\n生成聚类结果可视化...")
+        
+        # 使用t-SNE降维到2D用于可视化
+        if features.shape[1] > 50:
+            # 先用PCA降维到50维，再用t-SNE
+            pca = PCA(n_components=50, random_state=42)
+            features_pca = pca.fit_transform(features)
+            tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(features)//4))
+            features_2d = tsne.fit_transform(features_pca)
+        else:
+            tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(features)//4))
+            features_2d = tsne.fit_transform(features)
+        
+        # 创建颜色映射
+        colors = plt.cm.Set3(np.linspace(0, 1, self.n_levels))
+        
+        plt.figure(figsize=(12, 8))
+        
+        # 绘制散点图
+        for i in range(self.n_levels):
+            mask = (labels == i)
+            if mask.any():  # 使用.any()方法而不是np.any()
+                plt.scatter(features_2d[mask, 0], features_2d[mask, 1], 
+                           c=[colors[i]], label=f'Level {i+1}', alpha=0.7, s=50)
+        
+        plt.title('Clustering Results Visualization (t-SNE)', fontsize=16)
+        plt.xlabel('t-SNE Component 1', fontsize=12)
+        plt.ylabel('t-SNE Component 2', fontsize=12)
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # 保存图像
+        plot_path = os.path.join(self.output_dir, 'plots', 'clustering_visualization.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"聚类可视化图已保存到: {plot_path}")
+    
+    def save_contrastive_log(self, history, level_counts, total_images):
+        """保存对比学习训练日志"""
+        log_data = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'method': 'Contrastive Learning + K-means Clustering',
+            'total_images': total_images,
+            'n_levels': self.n_levels,
+            'img_size': self.img_size,
+            'device': str(self.device),
+            'final_contrastive_loss': history['contrastive_loss'][-1] if history['contrastive_loss'] else 0,
+            'level_distribution': {
+                f'Level_{i+1}': int(count) for i, count in enumerate(level_counts)
+            },
+            'level_percentages': {
+                f'Level_{i+1}': f"{count/total_images*100:.1f}%" for i, count in enumerate(level_counts)
+            },
+            'training_epochs': len(history['contrastive_loss']),
+            'output_directory': self.output_dir
+        }
+        
+        # 保存到JSON文件
+        log_path = os.path.join(self.output_dir, 'logs', 'contrastive_training_log.json')
+        with open(log_path, 'w', encoding='utf-8') as f:
+            json.dump(log_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"\n对比学习训练日志已保存到: {log_path}")
 
 if __name__ == "__main__":
     # 创建严重程度分类器
@@ -878,5 +1514,8 @@ if __name__ == "__main__":
         img_size=(64, 64)
     )
     
-    # 运行分类训练
-    classifier.run_severity_classification(epochs=50, learning_rate=0.001)
+    # 使用对比学习的无监督方法进行疾病严重程度分级
+    classifier.run_contrastive_severity_classification(epochs=100, learning_rate=0.001)
+    
+    # 如果需要使用原有的有监督方法，可以取消下面的注释
+    # classifier.run_severity_classification(epochs=50, learning_rate=0.001)

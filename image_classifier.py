@@ -163,12 +163,13 @@ class CNNModel(nn.Module):
         return x
 
 class ImageClassifier:
-    def __init__(self, data_dir='data', img_size=(64, 64), output_dir=None):
+    def __init__(self, data_dir='data', img_size=(64, 64), output_dir=None, lazy_init=False):
         self.data_dir = data_dir
         self.img_size = img_size
         self.model = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.class_names = ['diseased', 'healthy']
+        self.lazy_init = lazy_init
         print(f"Using device: {self.device}")
         
         # 创建输出目录管理
@@ -178,12 +179,20 @@ class ImageClassifier:
         else:
             self.output_dir = output_dir
         
-        # 确保输出目录存在
+        # 根据lazy_init决定是否立即创建目录
+        if not lazy_init:
+            self._ensure_output_dirs()
+        else:
+            # 只创建主输出目录
+            os.makedirs(self.output_dir, exist_ok=True)
+            print(f"Output directory: {self.output_dir} (lazy initialization)")
+    
+    def _ensure_output_dirs(self):
+        """确保输出目录存在（按需创建）"""
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, 'models'), exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, 'plots'), exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, 'logs'), exist_ok=True)
-        
         print(f"Output directory: {self.output_dir}")
         
     def load_and_preprocess_data(self):
@@ -560,6 +569,10 @@ class ImageClassifier:
                     print(f"Early stopping triggered at epoch {epoch+1}")
                     break
         
+        # 确保目录存在
+        if self.lazy_init:
+            self._ensure_output_dirs()
+        
         # Load best model
         best_model_path = os.path.join(self.output_dir, 'models', 'best_model.pth')
         self.model.load_state_dict(torch.load(best_model_path))
@@ -627,6 +640,10 @@ class ImageClassifier:
         plt.xlabel('Predicted Label')
         plt.tight_layout()
         
+        # 确保目录存在
+        if self.lazy_init:
+            self._ensure_output_dirs()
+        
         # 保存到输出目录
         confusion_matrix_path = os.path.join(self.output_dir, 'plots', 'confusion_matrix.png')
         plt.savefig(confusion_matrix_path, dpi=300, bbox_inches='tight')
@@ -637,6 +654,10 @@ class ImageClassifier:
     
     def plot_training_history(self, history):
         """Plot training history"""
+        # 确保目录存在
+        if self.lazy_init:
+            self._ensure_output_dirs()
+        
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
         
         # Accuracy
@@ -668,6 +689,10 @@ class ImageClassifier:
     def save_model(self, filename='disease_classifier_model.pth'):
         """Save the trained model"""
         if self.model:
+            # 确保目录存在
+            if self.lazy_init:
+                self._ensure_output_dirs()
+            
             # 保存到models子目录
             filepath = os.path.join(self.output_dir, 'models', filename)
             torch.save({

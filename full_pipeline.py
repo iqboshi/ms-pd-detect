@@ -29,53 +29,64 @@ except ImportError:
 
 from image_classifier import ImageClassifier
 from severity_classifier import SeverityClassifier
+from pipeline_config import PipelineConfig, ConfigTemplates, create_pipeline_config, validate_config
 
 class FullPipeline:
-    def __init__(self, tile_size=(64, 64), overlap=0):
+    def __init__(self, config=None, **kwargs):
         """
         初始化完整处理流水线
         
         Args:
-            tile_size: 切片大小，默认(64, 64)
-            overlap: 重叠像素数，默认0
+            config: 配置对象(PipelineConfig)或配置字典，如果为None则使用默认配置
+            **kwargs: 额外的配置参数，会覆盖config中的对应参数
         """
-        self.tile_size = tile_size
-        self.overlap = overlap
+        # 处理配置
+        if config is None:
+            # 使用默认配置
+            config_obj = PipelineConfig()
+        elif isinstance(config, PipelineConfig):
+            # 直接使用配置对象
+            config_obj = config
+        elif isinstance(config, dict):
+            # 从字典创建配置对象
+            config_obj = PipelineConfig()
+            config_obj.load_from_dict(config)
+        else:
+            raise ValueError("config必须是PipelineConfig对象、字典或None")
+        
+        # 应用额外的参数
+        if kwargs:
+            config_obj.load_from_dict(kwargs)
+        
+        # 验证配置
+        config_dict = config_obj.to_dict()
+        is_valid, errors = validate_config(config_dict)
+        if not is_valid:
+            raise ValueError(f"配置验证失败: {'; '.join(errors)}")
+        
+        # 设置实例属性
+        self.tile_size = config_obj.tile_size
+        self.overlap = config_obj.overlap
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.output_dir = f"outputs/full_pipeline_{self.timestamp}"
+        self.output_dir = config_obj.get_output_dir()
+        self.health_classifier_config = config_obj.health_classifier_config
+        self.severity_classifier_config = config_obj.severity_classifier_config
+        self.color_map = config_obj.color_map
         
         # 创建输出目录结构
         self.create_output_dirs()
         
-        # 颜色映射（7级：0=健康，1-6=疾病严重程度）
-        self.color_map = {
-            0: [0, 255, 0],      # 绿色 - 健康
-            1: [255, 255, 0],    # 黄色 - Level_1
-            2: [255, 200, 0],    # 橙黄色 - Level_2
-            3: [255, 150, 0],    # 橙色 - Level_3
-            4: [255, 100, 0],    # 深橙色 - Level_4
-            5: [255, 50, 0],     # 红橙色 - Level_5
-            6: [255, 0, 0]       # 红色 - Level_6
-        }
-        
         print(f"流水线初始化完成，输出目录: {self.output_dir}")
+        print(f"切片大小: {self.tile_size}, 重叠: {self.overlap}")
+        print(f"严重程度级别数: {self.severity_classifier_config['n_levels']}")
+        print(f"配置模板: 外部配置文件")
     
     def create_output_dirs(self):
-        """创建输出目录结构"""
-        dirs = [
-            self.output_dir,
-            os.path.join(self.output_dir, 'tiles'),
-            os.path.join(self.output_dir, 'tiles', 'all'),
-            os.path.join(self.output_dir, 'classified'),
-            os.path.join(self.output_dir, 'classified', 'healthy'),
-            os.path.join(self.output_dir, 'classified', 'diseased'),
-            os.path.join(self.output_dir, 'severity_graded'),
-            os.path.join(self.output_dir, 'results'),
-            os.path.join(self.output_dir, 'visualization')
-        ]
-        
-        for dir_path in dirs:
-            os.makedirs(dir_path, exist_ok=True)
+        """创建基础输出目录结构（按需创建，避免空目录）"""
+        # 只创建主输出目录，其他目录在需要时创建
+        os.makedirs(self.output_dir, exist_ok=True)
+        print(f"主输出目录已创建: {self.output_dir}")
+        print("其他子目录将在需要时自动创建")
     
     def load_large_image(self, image_path):
         """
@@ -228,7 +239,9 @@ class FullPipeline:
                 
                 # 创建切片信息（包括有效和无效区域）
                 tile_filename = f"tile_{row:04d}_{col:04d}.tif"
-                tile_path = os.path.join(self.output_dir, 'tiles', 'all', tile_filename)
+                # 按需创建tiles目录
+                tiles_dir = os.path.join(self.output_dir, 'tiles', 'all')
+                tile_path = os.path.join(tiles_dir, tile_filename)
                 
                 # 提取对应的nodata掩码
                 tile_nodata_mask = None
@@ -243,6 +256,8 @@ class FullPipeline:
                 
                 # 只保存有效切片，无效切片不保存也不参与后续预测
                 if save_tiles and is_valid:
+                    # 按需创建tiles目录
+                    os.makedirs(tiles_dir, exist_ok=True)
                     # 保存为TIFF格式以保持多通道数据完整性
                     if tifffile is not None:
                         # 使用tifffile保存，支持多通道
@@ -310,16 +325,16 @@ class FullPipeline:
         """
         print("开始健康/疾病分类...")
         
-        # 初始化分类器，指定已有的输出目录以避免创建新目录
-        classifier = ImageClassifier(output_dir='outputs/image_run_20250730_155131')
+        # 设置分类器输出目录（直接使用主输出目录，不创建health_classifier子目录）
+        classifier_output_dir = self.health_classifier_config.get('output_dir')
+        if classifier_output_dir is None:
+            classifier_output_dir = self.output_dir  # 直接使用主输出目录
+        
+        # 初始化分类器（使用lazy_init避免创建不必要的目录）
+        classifier = ImageClassifier(output_dir=classifier_output_dir, lazy_init=True)
         
         # 检查是否有预训练模型
-        model_files = [
-            'outputs/image_run_20250730_114156/models/best_model.pth',
-            'outputs/image_run_20250730_114156/models/disease_classifier_model.pth',
-            'disease_classifier_model.pth',
-            'outputs/image_run_*/models/disease_classifier_model.pth'
-        ]
+        model_files = self.health_classifier_config.get('model_search_paths', [])
         
         model_loaded = False
         for model_pattern in model_files:
@@ -391,11 +406,15 @@ class FullPipeline:
                 
                 # 复制文件到对应文件夹
                 if result == 'healthy':
-                    dest_path = os.path.join(self.output_dir, 'classified', 'healthy', tile_info['filename'])
+                    classified_dir = os.path.join(self.output_dir, 'classified', 'healthy')
+                    os.makedirs(classified_dir, exist_ok=True)  # 按需创建目录
+                    dest_path = os.path.join(classified_dir, tile_info['filename'])
                     classification_results['healthy'].append(tile_info)
                     classification_results['statistics']['healthy_count'] += 1
                 else:
-                    dest_path = os.path.join(self.output_dir, 'classified', 'diseased', tile_info['filename'])
+                    classified_dir = os.path.join(self.output_dir, 'classified', 'diseased')
+                    os.makedirs(classified_dir, exist_ok=True)  # 按需创建目录
+                    dest_path = os.path.join(classified_dir, tile_info['filename'])
                     classification_results['diseased'].append(tile_info)
                     classification_results['statistics']['diseased_count'] += 1
                 
@@ -414,7 +433,7 @@ class FullPipeline:
     
     def grade_severity(self, diseased_tiles):
         """
-        对疾病切片进行严重程度分级
+        使用基于对比学习的无监督方法对疾病切片进行严重程度分级
         
         Args:
             diseased_tiles: 疾病切片列表
@@ -426,117 +445,190 @@ class FullPipeline:
             print("没有疾病切片需要分级")
             return {'graded_tiles': [], 'statistics': {}}
         
-        print(f"开始对 {len(diseased_tiles)} 个疾病切片进行严重程度分级...")
+        print(f"开始使用对比学习无监督方法对 {len(diseased_tiles)} 个疾病切片进行严重程度分级...")
         
-        # 初始化严重程度分类器，指定已有的输出目录以避免创建新目录
-        severity_classifier = SeverityClassifier(output_dir='outputs/severity_run_20250730_155620')
+        # 创建临时目录用于存储疾病切片
+        temp_diseased_dir = os.path.join(self.output_dir, 'temp_diseased')
+        os.makedirs(temp_diseased_dir, exist_ok=True)
         
-        # 创建模型
-        severity_classifier.create_model()
+        # 复制疾病切片到临时目录
+        diseased_paths = []
+        for tile_info in diseased_tiles:
+            if tile_info.get('is_valid', True) and tile_info.get('path') is not None:
+                temp_path = os.path.join(temp_diseased_dir, tile_info['filename'])
+                shutil.copy2(tile_info['path'], temp_path)
+                diseased_paths.append(temp_path)
         
-        # 检查是否有预训练模型
-        model_files = [
-            'outputs/severity_run_20250730_114219/models/best_severity_model.pth',
-            'outputs/severity_run_20250730_114219/models/severity_classifier_model.pth',
-            'best_severity_model.pth',
-            'outputs/severity_run_*/models/best_severity_model.pth',
-            'outputs/severity_run_20250729_164244/models/best_severity_model.pth'
-        ]
+        if not diseased_paths:
+            print("没有有效的疾病切片可以分级")
+            return {'graded_tiles': [], 'statistics': {}}
+        
+        # 初始化严重程度分类器，使用对比学习方法（使用lazy_init避免创建不必要的目录）
+        severity_classifier = SeverityClassifier(
+            data_dir=self.output_dir,  # 使用当前输出目录
+            n_levels=self.severity_classifier_config.get('n_levels', 6),
+            img_size=self.severity_classifier_config.get('img_size', (64, 64)),
+            output_dir=self.output_dir,  # 指定输出目录，避免创建新的severity_run_目录
+            lazy_init=True  # 延迟初始化，避免创建不必要的目录
+        )
+        
+        print("============================================================")
+        print("使用基于对比学习的无监督严重程度分级")
+        print(f"严重程度级别数: {self.severity_classifier_config.get('n_levels', 6)}")
+        print(f"图像尺寸: {self.severity_classifier_config.get('img_size', (64, 64))}")
+        print("============================================================")
+        
+        # 检查是否有预训练的对比学习模型
+        contrastive_model_files = self.severity_classifier_config.get('model_search_paths', [])
         
         model_loaded = False
-        for model_pattern in model_files:
+        for model_pattern in contrastive_model_files:
             if '*' in model_pattern:
                 import glob
                 model_paths = glob.glob(model_pattern)
                 if model_paths:
                     model_path = sorted(model_paths)[-1]  # 使用最新的模型
                     try:
+                        # 创建模型
+                        severity_classifier.create_model()
+                        # 加载对比学习模型
                         checkpoint = torch.load(model_path, map_location=severity_classifier.device)
-                        if 'model_state_dict' in checkpoint:
-                            # 如果是完整的checkpoint，提取model_state_dict
+                        
+                        # 检查checkpoint格式并正确加载
+                        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                            # 完整的checkpoint格式
                             severity_classifier.model.load_state_dict(checkpoint['model_state_dict'])
                         else:
-                            # 如果是直接的state_dict
+                            # 直接的state_dict格式
                             severity_classifier.model.load_state_dict(checkpoint)
-                        print(f"加载预训练严重程度模型: {model_path}")
+                        
+                        print(f"加载预训练对比学习模型: {model_path}")
                         model_loaded = True
                         break
                     except Exception as e:
-                        print(f"加载模型 {model_path} 失败: {e}")
+                        print(f"加载对比学习模型 {model_path} 失败: {e}")
                         continue
             else:
                 if os.path.exists(model_pattern):
                     try:
+                        # 创建模型
+                        severity_classifier.create_model()
+                        # 加载对比学习模型
                         checkpoint = torch.load(model_pattern, map_location=severity_classifier.device)
-                        if 'model_state_dict' in checkpoint:
-                            # 如果是完整的checkpoint，提取model_state_dict
+                        
+                        # 检查checkpoint格式并正确加载
+                        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                            # 完整的checkpoint格式
                             severity_classifier.model.load_state_dict(checkpoint['model_state_dict'])
                         else:
-                            # 如果是直接的state_dict
+                            # 直接的state_dict格式
                             severity_classifier.model.load_state_dict(checkpoint)
-                        print(f"加载预训练严重程度模型: {model_pattern}")
+                        
+                        print(f"加载预训练对比学习模型: {model_pattern}")
                         model_loaded = True
                         break
                     except Exception as e:
-                        print(f"加载模型 {model_pattern} 失败: {e}")
+                        print(f"加载对比学习模型 {model_pattern} 失败: {e}")
                         continue
-                else:
-                    print(f"模型文件不存在: {model_pattern}")
         
         if not model_loaded:
-            print("未找到预训练严重程度模型，需要先训练severity_classifier")
-            print("请先运行: python severity_classifier.py")
-            return None
+            print("未找到预训练对比学习模型，将使用实时训练...")
+            print("注意：这将需要较长时间进行对比学习训练")
+            
+            # 运行完整的对比学习训练和聚类流程
+            try:
+                # 使用配置的训练参数
+                training_config = self.severity_classifier_config.get('training_config', {})
+                epochs = training_config.get('epochs', 50)
+                learning_rate = training_config.get('learning_rate', 0.001)
+                
+                print(f"开始对比学习训练 - Epochs: {epochs}, Learning Rate: {learning_rate}")
+                severity_classifier.run_contrastive_severity_classification(
+                    epochs=epochs,
+                    learning_rate=learning_rate
+                )
+                model_loaded = True
+            except Exception as e:
+                print(f"对比学习训练失败: {e}")
+                return None
         
-        # 分级结果
+        # 初始化分级结果（在try块外部，确保在所有分支中都可访问）
         grading_results = {
             'graded_tiles': [],
             'statistics': {f'Level_{i}': 0 for i in range(1, 7)}
         }
         
-        # 设置模型为评估模式
-        severity_classifier.model.eval()
-        
-        # 对每个疾病切片进行分级
-        for tile_info in tqdm(diseased_tiles, desc="分级切片"):
-            # 跳过无效切片（路径为None或is_valid为False）
-            if not tile_info.get('is_valid', True) or tile_info.get('path') is None:
-                # 为无效切片设置默认分级信息
-                tile_info['severity_level'] = 1  # 默认为最低级
-                tile_info['severity_confidence'] = 0.0
-                tile_info['final_level'] = 1
-                continue
-                
+        if model_loaded:
+            print("使用预训练模型进行特征提取和聚类分析...")
+            
             try:
-                # 使用severity_classifier的predict_single_image方法
-                # 这个方法已经支持5通道数据处理
-                predicted_class, confidence = severity_classifier.predict_single_image(tile_info['path'])
+                # 提取特征
+                features = severity_classifier.extract_features(diseased_paths)
                 
-                # 从类别名称中提取级别数字
-                if predicted_class.startswith('Level_'):
-                    severity_level = int(predicted_class.split('_')[1])
-                else:
-                    severity_level = 1  # 默认级别
+                # 进行聚类分级
+                severity_labels, level_counts = severity_classifier.cluster_severity_levels(features, diseased_paths)
                 
-                # 更新切片信息
-                tile_info['severity_level'] = severity_level
-                tile_info['severity_confidence'] = confidence
-                tile_info['final_level'] = severity_level  # 最终等级（1-6）
-                
-                grading_results['graded_tiles'].append(tile_info)
-                grading_results['statistics'][f'Level_{severity_level}'] += 1
-                
-                # 复制文件到分级文件夹
-                level_dir = os.path.join(self.output_dir, 'severity_graded', f'Level_{severity_level}')
-                os.makedirs(level_dir, exist_ok=True)
-                dest_path = os.path.join(level_dir, tile_info['filename'])
-                shutil.copy2(tile_info['path'], dest_path)
-                
-            except Exception as e:
-                print(f"分级切片 {tile_info['filename']} 时出错: {e}")
-                continue
+                # 解析聚类结果
+                level_assignments = {}
+                for i, img_path in enumerate(diseased_paths):
+                    filename = os.path.basename(img_path)
+                    # 聚类标签从0开始，转换为1-6的等级
+                    level_assignments[filename] = severity_labels[i] + 1
         
-        print("严重程度分级完成:")
+                # 对每个疾病切片进行分级
+                for tile_info in tqdm(diseased_tiles, desc="分级切片"):
+                    # 跳过无效切片（路径为None或is_valid为False）
+                    if not tile_info.get('is_valid', True) or tile_info.get('path') is None:
+                        # 为无效切片设置默认分级信息
+                        tile_info['severity_level'] = 1  # 默认为最低级
+                        tile_info['severity_confidence'] = 0.0
+                        tile_info['final_level'] = 1
+                        continue
+                        
+                    try:
+                        # 从聚类结果中获取分级
+                        filename = tile_info['filename']
+                        if filename in level_assignments:
+                            severity_level = level_assignments[filename]
+                        else:
+                            severity_level = 1  # 默认级别
+                        
+                        # 更新切片信息
+                        tile_info['severity_level'] = severity_level
+                        tile_info['severity_confidence'] = 0.8  # 聚类方法的默认置信度
+                        tile_info['final_level'] = severity_level  # 最终等级（1-6）
+                        
+                        grading_results['graded_tiles'].append(tile_info)
+                        grading_results['statistics'][f'Level_{severity_level}'] += 1
+                        
+                        # 复制文件到分级文件夹
+                        level_dir = os.path.join(self.output_dir, 'severity_graded', f'Level_{severity_level}')
+                        os.makedirs(level_dir, exist_ok=True)
+                        dest_path = os.path.join(level_dir, tile_info['filename'])
+                        shutil.copy2(tile_info['path'], dest_path)
+                        
+                    except Exception as e:
+                        print(f"分级切片 {tile_info['filename']} 时出错: {e}")
+                        continue
+                        
+            except Exception as e:
+                print(f"特征提取或聚类过程中出错: {e}")
+                # 回退到默认分级
+                for tile_info in diseased_tiles:
+                    if tile_info.get('is_valid', True) and tile_info.get('path') is not None:
+                        tile_info['severity_level'] = 1
+                        tile_info['severity_confidence'] = 0.5
+                        tile_info['final_level'] = 1
+                        grading_results['graded_tiles'].append(tile_info)
+                        grading_results['statistics']['Level_1'] += 1
+        
+        # 清理临时目录
+        try:
+            shutil.rmtree(temp_diseased_dir)
+        except:
+            pass
+        
+        print("基于对比学习的严重程度分级完成:")
         for level, count in grading_results['statistics'].items():
             print(f"  {level}: {count} 个切片")
         
@@ -587,7 +679,9 @@ class FullPipeline:
             result_image[y_start:y_end, x_start:x_end] = color
         
         # 保存结果图像
-        result_path = os.path.join(self.output_dir, 'results', 'classification_result.png')
+        results_dir = os.path.join(self.output_dir, 'results')
+        os.makedirs(results_dir, exist_ok=True)  # 按需创建目录
+        result_path = os.path.join(results_dir, 'classification_result.png')
         cv2.imwrite(result_path, cv2.cvtColor(result_image, cv2.COLOR_RGB2BGR))
         
         # 创建带图例的可视化
@@ -654,7 +748,9 @@ class FullPipeline:
         plt.tight_layout()
         
         # 保存可视化图像
-        viz_path = os.path.join(self.output_dir, 'visualization', 'result_with_legend.png')
+        viz_dir = os.path.join(self.output_dir, 'visualization')
+        os.makedirs(viz_dir, exist_ok=True)  # 按需创建目录
+        viz_path = os.path.join(viz_dir, 'result_with_legend.png')
         plt.savefig(viz_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -688,7 +784,9 @@ class FullPipeline:
             summary['level_percentages'][level] = round(percentage, 2)
         
         # 保存摘要
-        summary_path = os.path.join(self.output_dir, 'results', 'processing_summary.json')
+        results_dir = os.path.join(self.output_dir, 'results')
+        os.makedirs(results_dir, exist_ok=True)  # 按需创建目录
+        summary_path = os.path.join(results_dir, 'processing_summary.json')
         with open(summary_path, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
         
@@ -788,24 +886,64 @@ class FullPipeline:
             traceback.print_exc()
             return {'success': False, 'error': str(e)}
 
-def main():
+def main(image_path=None, config_template='default', config_file=None, **config_kwargs):
     """
     主函数 - 示例用法
+    
+    Args:
+        image_path: 输入图像路径，如果为None则使用默认路径
+        config_template: 配置模板名称 ('default', 'high_precision', 'fast_processing', 'medium', 'custom_color')
+        config_file: 外部配置文件路径（暂未实现）
+        **config_kwargs: 额外的配置参数，会覆盖模板中的对应参数
     """
     print("=== 完整图像处理流水线 ===")
     print("功能: 大图切片 → 健康/疾病分类 → 疾病严重程度分级 → 重组可视化")
     print()
     
-    # 直接使用指定的TIFF文件
-    image_path = "水稻所地块裁剪15m.tif"
+    # 处理输入图像路径
+    if image_path is None:
+        # 使用配置中的默认路径
+        default_config = PipelineConfig()
+        for path in default_config.default_image_paths:
+            if os.path.exists(path):
+                image_path = path
+                break
+        
+        if image_path is None:
+            print("未找到默认图像文件，请提供图像路径:")
+            print("可用的默认路径:", default_config.default_image_paths)
+            return
+    
     print(f"使用输入图像: {image_path}")
     
     if not os.path.exists(image_path):
         print(f"图像文件不存在: {image_path}")
         return
     
+    # 创建配置
+    try:
+        if config_file:
+            # TODO: 实现从文件加载配置
+            print(f"从配置文件加载: {config_file}")
+            config_dict = create_pipeline_config(config_template, **config_kwargs)
+        else:
+            # 使用模板配置
+            config_dict = create_pipeline_config(config_template, **config_kwargs)
+        
+        print(f"使用配置模板: {config_template}")
+        print(f"切片大小: {config_dict['tile_size']}")
+        print(f"严重程度级别数: {config_dict['severity_classifier_config']['n_levels']}")
+        
+    except Exception as e:
+        print(f"配置创建失败: {e}")
+        return
+    
     # 创建流水线实例
-    pipeline = FullPipeline(tile_size=(64, 64), overlap=0)
+    try:
+        pipeline = FullPipeline(config=config_dict)
+    except Exception as e:
+        print(f"流水线初始化失败: {e}")
+        return
     
     # 运行完整流水线
     result = pipeline.run_full_pipeline(image_path)
@@ -819,6 +957,42 @@ def main():
             print(f"错误信息: {result.get('error', '未知错误')}")
         else:
             print("流水线返回None")
+    
+    return result
 
 if __name__ == "__main__":
+    # 示例1: 使用默认配置
+    print("\n=== 示例1: 使用默认配置 ===")
     main()
+    
+    # 示例2: 使用高精度配置模板
+    print("\n=== 示例2: 使用高精度配置模板 ===")
+    # main(config_template='high_precision')
+    
+    # 示例3: 使用快速处理配置模板
+    print("\n=== 示例3: 使用快速处理配置模板 ===")
+    # main(config_template='fast_processing')
+    
+    # 示例4: 使用模板+自定义参数
+    print("\n=== 示例4: 使用模板+自定义参数 ===")
+    # main(config_template='medium', tile_size=(256, 256), overlap=32)
+    
+    # 示例5: 直接使用配置对象
+    print("\n=== 示例5: 直接使用配置对象 ===")
+    # custom_config = ConfigTemplates.get_high_precision_config()
+    # pipeline = FullPipeline(config=custom_config)
+    # result = pipeline.run_full_pipeline("your_image.tif")
+    
+    print("\n=== 外部配置文件流水线使用说明 ===")
+    print("1. 默认配置: main() - 使用默认配置模板")
+    print("2. 指定模板: main(config_template='high_precision') - 使用预定义模板")
+    print("3. 模板+参数: main(config_template='default', tile_size=(128,128)) - 模板基础上自定义")
+    print("4. 配置对象: pipeline = FullPipeline(config=ConfigTemplates.get_xxx_config())")
+    print("\n可用配置模板:")
+    print("- 'default': 默认配置 (64x64切片, 6级别)")
+    print("- 'high_precision': 高精度配置 (512x512切片, 12级别)")
+    print("- 'fast_processing': 快速处理配置 (32x32切片, 3级别)")
+    print("- 'medium': 中等配置 (128x128切片, 8级别)")
+    print("- 'custom_color': 自定义颜色配置 (5级别)")
+    print("\n配置文件位置: pipeline_config.py")
+    print("可以直接修改 pipeline_config.py 来调整默认参数和添加新模板")
