@@ -161,7 +161,7 @@ class ImageClassifier:
         # 创建输出目录管理
         if output_dir is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.output_dir = f"outputs/run_{timestamp}"
+            self.output_dir = f"outputs/image_run_{timestamp}"
         else:
             self.output_dir = output_dir
         

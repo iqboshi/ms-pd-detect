@@ -300,14 +300,14 @@ class FullPipeline:
         print("开始健康/疾病分类...")
         
         # 初始化分类器，指定已有的输出目录以避免创建新目录
-        classifier = ImageClassifier(output_dir='outputs/run_20250730_114156')
+        classifier = ImageClassifier(output_dir='outputs/image_run_20250730_114156')
         
         # 检查是否有预训练模型
         model_files = [
-            'outputs/run_20250730_114156/models/best_model.pth',
-            'outputs/run_20250730_114156/models/disease_classifier_model.pth',
+            'outputs/image_run_20250730_114156/models/best_model.pth',
+            'outputs/image_run_20250730_114156/models/disease_classifier_model.pth',
             'disease_classifier_model.pth',
-            'outputs/run_*/models/disease_classifier_model.pth'
+            'outputs/image_run_*/models/disease_classifier_model.pth'
         ]
         
         model_loaded = False
