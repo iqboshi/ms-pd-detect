@@ -227,7 +227,7 @@ class FullPipeline:
                     tile = cv2.resize(tile, self.tile_size)
                 
                 # 创建切片信息（包括有效和无效区域）
-                tile_filename = f"tile_{row:04d}_{col:04d}.png"
+                tile_filename = f"tile_{row:04d}_{col:04d}.tif"
                 tile_path = os.path.join(self.output_dir, 'tiles', 'all', tile_filename)
                 
                 # 提取对应的nodata掩码
@@ -243,7 +243,18 @@ class FullPipeline:
                 
                 # 只保存有效切片，无效切片不保存也不参与后续预测
                 if save_tiles and is_valid:
-                    cv2.imwrite(tile_path, cv2.cvtColor(tile, cv2.COLOR_RGB2BGR))
+                    # 保存为TIFF格式以保持多通道数据完整性
+                    if tifffile is not None:
+                        # 使用tifffile保存，支持多通道
+                        tifffile.imwrite(tile_path, tile)
+                    else:
+                        # 回退到cv2，但只能保存3通道
+                        if len(tile.shape) == 3 and tile.shape[2] > 3:
+                            # 如果是多通道，只保存前3个通道
+                            tile_rgb = tile[:, :, :3]
+                            cv2.imwrite(tile_path, cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2BGR))
+                        else:
+                            cv2.imwrite(tile_path, cv2.cvtColor(tile, cv2.COLOR_RGB2BGR))
                 elif not is_valid:
                     # 无效切片不保存文件，设置路径为None
                     tile_path = None
@@ -300,7 +311,7 @@ class FullPipeline:
         print("开始健康/疾病分类...")
         
         # 初始化分类器，指定已有的输出目录以避免创建新目录
-        classifier = ImageClassifier(output_dir='outputs/image_run_20250730_114156')
+        classifier = ImageClassifier(output_dir='outputs/image_run_20250730_155131')
         
         # 检查是否有预训练模型
         model_files = [
@@ -418,7 +429,7 @@ class FullPipeline:
         print(f"开始对 {len(diseased_tiles)} 个疾病切片进行严重程度分级...")
         
         # 初始化严重程度分类器，指定已有的输出目录以避免创建新目录
-        severity_classifier = SeverityClassifier(output_dir='outputs/severity_run_20250730_114219')
+        severity_classifier = SeverityClassifier(output_dir='outputs/severity_run_20250730_155620')
         
         # 创建模型
         severity_classifier.create_model()
@@ -486,13 +497,6 @@ class FullPipeline:
         # 设置模型为评估模式
         severity_classifier.model.eval()
         
-        # 数据转换
-        import torchvision.transforms as transforms
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
         # 对每个疾病切片进行分级
         for tile_info in tqdm(diseased_tiles, desc="分级切片"):
             # 跳过无效切片（路径为None或is_valid为False）
@@ -504,21 +508,15 @@ class FullPipeline:
                 continue
                 
             try:
-                # 加载图像
-                image = Image.open(tile_info['path']).convert('RGB')
-                image = image.resize(severity_classifier.img_size)
+                # 使用severity_classifier的predict_single_image方法
+                # 这个方法已经支持5通道数据处理
+                predicted_class, confidence = severity_classifier.predict_single_image(tile_info['path'])
                 
-                # 预处理
-                image_tensor = transform(image).unsqueeze(0).to(severity_classifier.device)
-                
-                # 预测
-                with torch.no_grad():
-                    outputs = severity_classifier.model(image_tensor)
-                    probabilities = torch.softmax(outputs, dim=1)
-                    _, predicted = torch.max(outputs, 1)
-                    
-                    severity_level = predicted.item() + 1  # 转换为1-6级
-                    confidence = probabilities[0][predicted.item()].item()
+                # 从类别名称中提取级别数字
+                if predicted_class.startswith('Level_'):
+                    severity_level = int(predicted_class.split('_')[1])
+                else:
+                    severity_level = 1  # 默认级别
                 
                 # 更新切片信息
                 tile_info['severity_level'] = severity_level

@@ -66,12 +66,27 @@ class SeverityDataset(Dataset):
                     finally:
                         sys.stderr = old_stderr
                     
-                    # 如果是多通道，取前3个通道或转换为RGB
-                    if len(image_array.shape) == 3 and image_array.shape[2] > 3:
-                        image_array = image_array[:, :, :3]  # 取前3个通道
+                    # 处理多通道数据，使用所有5个波段（蓝、绿、红、红边、近红外）
+                    if len(image_array.shape) == 3 and image_array.shape[2] >= 5:
+                        # Use all 5 bands: 蓝、绿、红、红边、近红外
+                        image_array = image_array[:, :, :5]
+                    elif len(image_array.shape) == 3 and image_array.shape[2] == 4:
+                        # If only 4 channels, duplicate the last channel to make 5
+                        last_channel = image_array[:, :, -1:]
+                        image_array = np.concatenate([image_array, last_channel], axis=2)
+                    elif len(image_array.shape) == 3 and image_array.shape[2] == 3:
+                        # If only 3 channels (RGB), duplicate red and green to make 5 bands
+                        red_edge = image_array[:, :, 0:1]  # Use red as red edge
+                        nir = image_array[:, :, 1:2]       # Use green as NIR
+                        image_array = np.concatenate([image_array, red_edge, nir], axis=2)
                     elif len(image_array.shape) == 2:
-                        # 灰度图转RGB
-                        image_array = np.stack([image_array] * 3, axis=-1)
+                        # 灰度图复制为5通道
+                        image_array = np.stack([image_array] * 5, axis=-1)
+                    elif len(image_array.shape) == 3 and image_array.shape[2] < 5:
+                        # If less than 5 channels, pad by repeating the last channel
+                        while image_array.shape[2] < 5:
+                            last_channel = image_array[:, :, -1:]
+                            image_array = np.concatenate([image_array, last_channel], axis=2)
                     
                     # 确保数据类型正确
                     if image_array.dtype != np.uint8:
@@ -81,33 +96,73 @@ class SeverityDataset(Dataset):
                     
                     # 调整大小
                     image_array = cv2.resize(image_array, self.img_size)
-                    # 转换为PIL图像
-                    image = Image.fromarray(image_array)
+                    # 对于5通道数据，保持为numpy数组，不转换为PIL
+                    if image_array.shape[2] == 5:
+                        image = image_array  # 保持为numpy数组
+                    else:
+                        # 转换为PIL图像（仅用于3通道或更少）
+                        image = Image.fromarray(image_array)
                 else:
                     # 回退到PIL，但可能失败
                     try:
                         image = Image.open(image_path).convert('RGB')
                         image = image.resize(self.img_size)
+                        # Convert RGB to 5 channels
+                        image_array = np.array(image)
+                        red_edge = image_array[:, :, 0:1]  # Use red as red edge
+                        nir = image_array[:, :, 1:2]       # Use green as NIR
+                        image_array = np.concatenate([image_array, red_edge, nir], axis=2)
+                        # 保持为5通道numpy数组
+                        image = image_array
                     except:
                         # 如果PIL也失败，创建随机图像
                         print(f"警告: 无法读取 {image_path}，使用随机图像")
-                        image_array = np.random.randint(0, 256, (*self.img_size, 3), dtype=np.uint8)
-                        image = Image.fromarray(image_array)
+                        image_array = np.random.randint(0, 256, (*self.img_size, 5), dtype=np.uint8)
+                        # 保持为5通道numpy数组
+                        image = image_array
             else:
                 # 使用PIL读取其他格式
                 image = Image.open(image_path).convert('RGB')
                 image = image.resize(self.img_size)
+                # Convert RGB to 5 channels
+                image_array = np.array(image)
+                red_edge = image_array[:, :, 0:1]  # Use red as red edge
+                nir = image_array[:, :, 1:2]       # Use green as NIR
+                image_array = np.concatenate([image_array, red_edge, nir], axis=2)
+                # 保持为5通道numpy数组，不转换为PIL
+                image = image_array
             
-            if self.transform:
-                image = self.transform(image)
+            # 如果使用了tifffile并且有5通道数据，直接处理numpy数组
+            if isinstance(image, np.ndarray) and len(image.shape) == 3 and image.shape[2] == 5:
+                # 直接处理5通道numpy数组
+                if self.transform and hasattr(self.transform, 'transforms'):
+                    # 对于5通道数据，只应用归一化，跳过PIL相关的变换
+                    image = image.astype(np.float32) / 255.0
+                    image = torch.from_numpy(image).permute(2, 0, 1)  # HWC -> CHW
+                    # 应用归一化（如果有的话）
+                    for t in self.transform.transforms:
+                        if isinstance(t, transforms.Normalize):
+                            # 对5通道数据使用前3通道的归一化参数，后2通道使用相同参数
+                            mean = list(t.mean) + [t.mean[0], t.mean[1]]  # 扩展到5通道
+                            std = list(t.std) + [t.std[0], t.std[1]]      # 扩展到5通道
+                            image = transforms.Normalize(mean=mean, std=std)(image)
+                            break
+                else:
+                    # 没有变换，直接转换
+                    image = image.astype(np.float32) / 255.0
+                    image = torch.from_numpy(image).permute(2, 0, 1)  # HWC -> CHW
             else:
-                # 默认转换为tensor
-                image = transforms.ToTensor()(image)
+                # 对于PIL图像（3通道），使用原有的变换流程
+                if self.transform:
+                    image = self.transform(image)
+                else:
+                    # 默认转换为tensor
+                    image = transforms.ToTensor()(image)
                 
         except Exception as e:
             print(f"Error loading image {image_path}: {e}")
-            # 返回空白图像
-            image = torch.zeros(3, *self.img_size)
+            # 返回空白图像（5通道）
+            image = torch.zeros(5, *self.img_size)
             
         return image, label
 
@@ -181,8 +236,17 @@ class SeverityClassifier:
                 # 处理tif文件
                 if path.lower().endswith(('.tif', '.tiff')):
                     if tifffile is not None:
-                        # 使用tifffile读取多通道tif
-                        img_array = tifffile.imread(path)
+                        # 使用tifffile读取多通道tif，完全抑制GDAL_NODATA警告
+                        import sys
+                        import io
+                        
+                        # 临时重定向stderr来抑制tifffile内部警告
+                        old_stderr = sys.stderr
+                        sys.stderr = io.StringIO()
+                        try:
+                            img_array = tifffile.imread(path)
+                        finally:
+                            sys.stderr = old_stderr
                         # 如果是多通道，取前3个通道或转换为RGB
                         if len(img_array.shape) == 3 and img_array.shape[2] > 3:
                             img_array = img_array[:, :, :3]  # 取前3个通道
@@ -295,7 +359,7 @@ class SeverityClassifier:
                 super(SeverityCNN, self).__init__()
                 
                 # 卷积层
-                self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+                self.conv1 = nn.Conv2d(5, 32, 3, padding=1)
                 self.bn1 = nn.BatchNorm2d(32)
                 self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
                 self.bn2 = nn.BatchNorm2d(64)
@@ -585,6 +649,38 @@ class SeverityClassifier:
         
         return accuracy
     
+    def predict_single_image(self, img_path):
+        """预测单张图像的严重程度级别"""
+        if self.model is None:
+            print("请先训练或加载模型")
+            return None, 0.0
+        
+        try:
+            # 使用SeverityDataset的图像加载逻辑
+            dataset = SeverityDataset([img_path], [0], transform=None, img_size=self.img_size)
+            image, _ = dataset[0]
+            
+            # 添加批次维度
+            image = image.unsqueeze(0).to(self.device)
+            
+            # 预测
+            self.model.eval()
+            with torch.no_grad():
+                outputs = self.model(image)
+                probabilities = torch.softmax(outputs, dim=1)
+                _, predicted = torch.max(outputs, 1)
+                
+                predicted_class = predicted.item()
+                confidence = probabilities[0][predicted_class].item()
+                
+                result = self.severity_levels[predicted_class]
+            
+            return result, confidence
+            
+        except Exception as e:
+            print(f"预测图像 {img_path} 时出错: {e}")
+            return "Level_1", 0.0
+    
     def generate_full_confusion_matrix(self, image_paths, true_labels):
         """使用所有diseased数据生成混淆矩阵"""
         print("\n生成使用所有diseased数据的混淆矩阵...")
@@ -762,7 +858,7 @@ class SeverityClassifier:
             # 10. 保存训练日志
             self.save_training_log(history, accuracy, len(valid_paths), thresholds)
             
-            print("\n=" * 60)
+            print("\n=" * 2)
             print("严重程度分级训练完成!")
             print(f"最佳验证准确率: {history['best_val_acc']:.2f}%")
             print(f"最终验证准确率: {accuracy:.4f}")

@@ -48,7 +48,7 @@ class SpectralImageDataset(Dataset):
         label = self.labels[idx]
         
         # 确保图像是HWC格式（Height, Width, Channels）
-        if len(image.shape) == 3 and image.shape[0] == 3:
+        if len(image.shape) == 3 and image.shape[0] == 5:
             # 如果是CHW格式，转换为HWC格式
             image = np.transpose(image, (1, 2, 0))
         
@@ -60,7 +60,20 @@ class SpectralImageDataset(Dataset):
         image = (image * 255).astype(np.uint8)
         
         # 应用数据变换
-        if self.transform:
+        if self.transform and len(image.shape) == 3 and image.shape[2] == 5:
+            # 对于5通道数据，跳过PIL相关的变换，只应用归一化
+            image = torch.FloatTensor(image).permute(2, 0, 1)  # HWC -> CHW
+            # 应用归一化（如果变换中包含归一化）
+            for t in self.transform.transforms:
+                if isinstance(t, transforms.Normalize):
+                    # 扩展归一化参数到5通道
+                    mean = list(t.mean) + [t.mean[0], t.mean[1]]  # 扩展到5通道
+                    std = list(t.std) + [t.std[0], t.std[1]]      # 扩展到5通道
+                    normalize = transforms.Normalize(mean=mean, std=std)
+                    image = normalize(image)
+                    break
+        elif self.transform:
+            # 对于3通道或更少的数据，使用原有的变换
             image = self.transform(image)
         else:
             # 如果没有变换，直接转换为tensor
@@ -70,12 +83,12 @@ class SpectralImageDataset(Dataset):
 
 # CNN模型定义
 class CNNModel(nn.Module):
-    def __init__(self, num_classes=2):
+    def __init__(self, num_classes=2, input_channels=5):
         super(CNNModel, self).__init__()
         
         # 第一个卷积块 - 增加更多特征提取
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
             nn.Conv2d(32, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
@@ -240,23 +253,49 @@ class ImageClassifier:
                             # Re-enable logging
                             logging.disable(logging.NOTSET)
                     
-                    # Handle multi-channel spectral data - use more channels for better classification
-                    if len(img_array.shape) == 3 and img_array.shape[2] > 3:
-                        # For spectral data, use more meaningful channel combinations
-                        # Take channels that might represent different spectral bands
-                        if img_array.shape[2] >= 6:
-                            # Use channels with better spacing for spectral analysis
-                            selected_channels = [0, img_array.shape[2]//3, img_array.shape[2]*2//3]
-                            img_array = img_array[:, :, selected_channels]
+                    # Handle different image shapes and channel configurations
+                    # print(f"Original image shape: {img_array.shape}, dtype: {img_array.dtype}")
+                    
+                    # Handle multi-channel spectral data - use all 5 bands (蓝、绿、红、红边、近红外)
+                    if len(img_array.shape) == 3:
+                        height, width, channels = img_array.shape
+                        
+                        # If image is too small, resize it first
+                        if height < 8 or width < 8:
+                            # Use cv2 to resize small images
+                            import cv2
+                            target_size = max(64, max(height * 64, width * 64))  # Scale up small images
+                            img_array = cv2.resize(img_array, (target_size, target_size), interpolation=cv2.INTER_CUBIC)
+                            print(f"Resized small image to: {img_array.shape}")
+                        
+                        # Handle channel configuration
+                        if channels >= 5:
+                            # Use all 5 bands: 蓝、绿、红、红边、近红外
+                            img_array = img_array[:, :, :5]
+                        elif channels == 4:
+                            # If only 4 channels, duplicate the last channel to make 5
+                            last_channel = img_array[:, :, -1:]
+                            img_array = np.concatenate([img_array, last_channel], axis=2)
+                        elif channels == 3:
+                            # If only 3 channels (RGB), duplicate red and green to make 5 bands
+                            red_edge = img_array[:, :, 0:1]  # Use red as red edge
+                            nir = img_array[:, :, 1:2]       # Use green as NIR
+                            img_array = np.concatenate([img_array, red_edge, nir], axis=2)
+                        elif channels == 1:
+                            # If single channel, replicate to 5 channels
+                            img_array = np.repeat(img_array, 5, axis=2)
                         else:
-                            # If less than 6 channels, take first 3
-                            img_array = img_array[:, :, :3]
+                            # If less than 5 channels, pad by repeating the last channel
+                            while img_array.shape[2] < 5:
+                                last_channel = img_array[:, :, -1:]
+                                img_array = np.concatenate([img_array, last_channel], axis=2)
                     elif len(img_array.shape) == 2:
-                        # If grayscale, convert to RGB
-                        img_array = np.stack([img_array] * 3, axis=2)
-                    elif len(img_array.shape) == 3 and img_array.shape[2] == 1:
-                        # If single channel with third dimension, convert to RGB
-                        img_array = np.repeat(img_array, 3, axis=2)
+                        # If grayscale, replicate to 5 channels
+                        img_array = np.stack([img_array] * 5, axis=2)
+                    else:
+                        raise ValueError(f"Unsupported image shape: {img_array.shape}")
+                    
+                    # print(f"Processed image shape: {img_array.shape}")
                     
                     # Improved normalization for spectral data
                     if img_array.dtype != np.uint8:
@@ -265,13 +304,17 @@ class ImageClassifier:
                         img_array = np.clip(img_array, p2, p98)
                         img_array = ((img_array - p2) / (p98 - p2) * 255).astype(np.uint8)
                     
-                    # Convert to PIL image for resizing
-                    img = Image.fromarray(img_array)
-                    img = img.resize(self.img_size, Image.Resampling.LANCZOS)
+                    # Resize using cv2 for 5-channel data
+                    import cv2
+                    img_array = cv2.resize(img_array, self.img_size, interpolation=cv2.INTER_LANCZOS4)
                     
-                    # Convert to numpy array and normalize to 0-1
-                    img_array = np.array(img) / 255.0
+                    # Normalize to 0-1
+                    if img_array.dtype != np.float32:
+                        img_array = img_array.astype(np.float32)
+                    if img_array.max() > 1.0:
+                        img_array = img_array / 255.0
                     
+                    # print(f"Final image shape: {img_array.shape}, range: {img_array.min():.3f}-{img_array.max():.3f}")
                     return img_array
                     
                 except ImportError:
@@ -295,8 +338,20 @@ class ImageClassifier:
                 # Resize image
                 img = img.resize(self.img_size, Image.Resampling.LANCZOS)
                 
-                # Convert to numpy array and normalize
-                img_array = np.array(img) / 255.0
+                # Convert to numpy array
+                img_array = np.array(img)
+                
+                # Convert RGB to 5 channels by duplicating red and green as red edge and NIR
+                if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                    red_edge = img_array[:, :, 0:1]  # Use red as red edge
+                    nir = img_array[:, :, 1:2]       # Use green as NIR
+                    img_array = np.concatenate([img_array, red_edge, nir], axis=2)
+                elif len(img_array.shape) == 2:
+                    # If grayscale, replicate to 5 channels
+                    img_array = np.stack([img_array] * 5, axis=2)
+                
+                # Normalize to 0-1
+                img_array = img_array / 255.0
                 
                 return img_array
                 
@@ -315,7 +370,7 @@ class ImageClassifier:
     
     def create_model(self):
         """Create CNN model for spectral data classification"""
-        model = CNNModel(num_classes=2)
+        model = CNNModel(num_classes=2, input_channels=5)
         model = model.to(self.device)
         
         self.model = model
@@ -669,19 +724,32 @@ class ImageClassifier:
         if img.max() > 1.0:
             img = img / 255.0
         
-        # Convert to uint8 format
-        img = (img * 255).astype(np.uint8)
+        # Handle 5-channel data directly without PIL conversion
+        if len(img.shape) == 3 and img.shape[2] == 5:
+            # For 5-channel data, convert directly to tensor
+            img_tensor = torch.FloatTensor(img).permute(2, 0, 1)  # HWC -> CHW
+            # Apply normalization for 5 channels (extend RGB normalization)
+            mean = [0.485, 0.456, 0.406, 0.485, 0.456]  # Extend to 5 channels
+            std = [0.229, 0.224, 0.225, 0.229, 0.224]   # Extend to 5 channels
+            normalize = transforms.Normalize(mean=mean, std=std)
+            img_tensor = normalize(img_tensor)
+        else:
+            # Convert to uint8 format for PIL processing
+            img = (img * 255).astype(np.uint8)
+            
+            # Data transforms for 3-channel data
+            transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize(self.img_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            
+            # Apply transforms
+            img_tensor = transform(img)
         
-        # Data transforms
-        transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize(self.img_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        # Apply transforms and add batch dimension
-        img_tensor = transform(img).unsqueeze(0).to(self.device)
+        # Add batch dimension
+        img_tensor = img_tensor.unsqueeze(0).to(self.device)
         
         # Prediction
         self.model.eval()
